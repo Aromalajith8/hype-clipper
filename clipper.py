@@ -1,4 +1,4 @@
-﻿import argparse, json, os, re, subprocess, sys
+﻿import argparse, csv, hashlib, json, os, re, subprocess, sys
 from collections import defaultdict
 import cv2
 import numpy as np
@@ -17,7 +17,7 @@ def get_metadata(url, cookies=None):
         raise RuntimeError(f"yt-dlp metadata failed:\n{res.stderr}")
     return json.loads(res.stdout)
 
-def download_audio(url, out_path="temp_audio.m4a", cookies=None):
+def download_audio(url, out_path, cookies=None):
     if os.path.exists(out_path):
         os.remove(out_path)
     cmd = [py_cmd(), "-m", "yt_dlp", "-f", "bestaudio[ext=m4a]/bestaudio", "-o", out_path]
@@ -27,27 +27,41 @@ def download_audio(url, out_path="temp_audio.m4a", cookies=None):
     subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     return out_path if os.path.exists(out_path) else None
 
-def transcribe_segments(audio_path):
+def transcribe_segments(audio_path, cache_path):
+    if os.path.exists(cache_path):
+        try:
+            with open(cache_path, "r", encoding="utf-8") as f:
+                cached = json.load(f)
+            if cached:
+                print(f"[1/4] Loaded {len(cached)} cached transcript segments.")
+                return cached
+        except Exception:
+            pass
+
     print("[1/4] Transcribing speech with faster-whisper...")
     try:
         from faster_whisper import WhisperModel
-        device = "cuda" if subprocess.run(["nvidia-smi"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0 else "cpu"
-        compute = "float16" if device == "cuda" else "int8"
-        model = WhisperModel("small", device=device, compute_type=compute)
+        has_gpu = subprocess.run(["nvidia-smi"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0
+        device = "cuda" if has_gpu else "cpu"
+        compute = "float16" if has_gpu else "int8"
+        model_size = "small" if has_gpu else "base"
+        model = WhisperModel(model_size, device=device, compute_type=compute)
         segs, _ = model.transcribe(audio_path, beam_size=3, vad_filter=True)
         out = []
         for s in segs:
             txt = s.text.strip()
             if txt:
                 out.append({"start": float(s.start), "end": float(s.end), "text": txt})
-        print(f"  -> Captured {len(out)} speech segments on {device.upper()}.")
+        with open(cache_path, "w", encoding="utf-8") as f:
+            json.dump(out, f, indent=2)
+        print(f"  -> Transcribed {len(out)} segments on {device.upper()} ({model_size}).")
         return out
     except Exception as e:
-        print(f"  -> Whisper skipped ({e}); using signal scoring.")
+        print(f"  -> Whisper skipped ({e}); falling back to audio/chat signals.")
         return []
 
 def score_audio_variation(audio_path, bucket_sec=10):
-    print("[2/4] Measuring audio excitement & volume jumps...")
+    print("[2/4] Scoring audio energy & sudden volume jumps...")
     deltas = defaultdict(float)
     if not audio_path or not os.path.exists(audio_path):
         return deltas
@@ -76,7 +90,7 @@ def score_audio_variation(audio_path, bucket_sec=10):
     return deltas
 
 def score_chat_and_motion(url, duration, chat_side="right", cookies=None, bucket_sec=10):
-    print("[3/4] Checking chat velocity & on-screen chat motion...")
+    print("[3/4] Checking live chat velocity & on-screen chat scroll motion...")
     chat_file = "temp_chat.json"
     if os.path.exists(chat_file):
         os.remove(chat_file)
@@ -132,164 +146,192 @@ def score_chat_and_motion(url, duration, chat_side="right", cookies=None, bucket
 
     return chat_buckets, motion_buckets
 
-def _parse_clips_json(content, num_clips, min_len, max_len, duration):
+def _snap_to_hook_and_payoff(segments, start_sec, end_sec, min_len, max_len, duration):
+    """Snaps a candidate window so it opens on a hook and holds through a sentence/payoff end."""
+    start = max(0.0, float(start_sec))
+    end = min(float(duration), float(end_sec))
+    if end - start < min_len:
+        end = min(float(duration), start + min_len)
+    if end - start > max_len:
+        end = start + max_len
+
+    if not segments:
+        return round(start, 2), round(min(float(duration), end), 2)
+
+    hook_re = re.compile(r"\b(wait|what|why|how|no way|bro|crazy|insane|look|watch|secret|never|caught|mistake|truth)\b", re.I)
+
+    # Pull start back slightly toward a hook line if within 8s
+    for s in reversed(segments):
+        if start - 8.0 <= s["start"] <= start + 2.0 and hook_re.search(s["text"]):
+            start = max(0.0, s["start"] - 1.0)
+            break
+
+    # Extend end forward up to max_len until a natural sentence boundary (. ! ?) so payoff isn't cut
+    best_end = min(float(duration), start + max_len, max(end, start + min_len))
+    for s in segments:
+        if s["end"] < start + min_len:
+            continue
+        if s["end"] - start > max_len:
+            break
+        if re.search(r"[.!?]$", s["text"].strip()):
+            best_end = min(float(duration), s["end"] + 0.8)
+            break
+        best_end = min(float(duration), s["end"] + 0.5)
+
+    if best_end - start < min_len:
+        best_end = min(float(duration), start + min_len)
+    if best_end - start > max_len:
+        best_end = start + max_len
+
+    return round(start, 2), round(best_end, 2)
+
+def _parse_ai_clips(content, num_clips, min_len, max_len, duration, segments):
     match = re.search(r"\[[\s\S]*\]", content)
     if not match:
         return []
-    raw_clips = json.loads(match.group(0))
-    valid = []
-    for c in raw_clips:
-        st = max(0.0, float(c.get("start", 0)))
-        en = float(c.get("end", 0))
-        dur = en - st
-        if dur < min_len:
-            en = st + min_len
-        elif dur > max_len:
-            en = st + max_len
-        en = min(duration, en)
-        if en - st >= 5:
-            valid.append((st, en, c.get("reason", "AI hook + payoff")))
-    return valid[:num_clips]
+    items = json.loads(match.group(0))
+    results = []
+    for item in items:
+        st, en = _snap_to_hook_and_payoff(
+            segments, item.get("start", 0), item.get("end", 0), min_len, max_len, duration
+        )
+        if en - st >= min(min_len, 15):
+            results.append({
+                "start": st,
+                "end": en,
+                "duration": round(en - st, 1),
+                "title": str(item.get("title", "Hook + Payoff Clip"))[:80],
+                "reason": str(item.get("reason", "Strong hook and complete payoff"))[:140],
+            })
+    return results[:num_clips]
 
-def _call_claude(prompt, model_name, api_key):
-    resp = requests.post(
-        "https://api.anthropic.com/v1/messages",
-        headers={
-            "x-api-key": api_key,
-            "anthropic-version": "2023-06-01",
-            "content-type": "application/json",
-        },
-        json={
-            "model": model_name,
-            "max_tokens": 2048,
-            "temperature": 0.3,
-            "messages": [{"role": "user", "content": prompt}],
-        },
-        timeout=90,
-    )
-    resp.raise_for_status()
-    blocks = resp.json().get("content", [])
-    return "\n".join(b.get("text", "") for b in blocks if b.get("type") == "text")
-
-def _call_ollama(prompt, model_name, host="http://127.0.0.1:11434"):
-    resp = requests.post(
-        f"{host.rstrip('/')}/api/generate",
-        json={"model": model_name, "prompt": prompt, "stream": False, "options": {"temperature": 0.3}},
-        timeout=300,
-    )
-    resp.raise_for_status()
-    return resp.json().get("response", "")
-
-def select_hook_to_payoff_clips(segments, num_clips, min_len, max_len, duration, provider, claude_model, ollama_model, ollama_host):
-    claude_key = os.environ.get("ANTHROPIC_API_KEY", "").strip()
+def select_clips(segments, audio_scores, chat_scores, motion_scores, duration, num_clips, min_len, max_len, provider, ollama_model):
     groq_key = os.environ.get("GROQ_API_KEY", "").strip()
     gemini_key = os.environ.get("GEMINI_API_KEY", "").strip()
 
+    prompt = None
     if segments:
-        compact = "\n".join(
-            f"[{int(s['start'])}s-{int(s['end'])}s] {s['text']}" for s in segments[:600]
+        transcript_lines = "\n".join(
+            f"[{int(s['start'])}s-{int(s['end'])}s] {s['text']}" for s in segments[:650]
         )
         prompt = (
-            f"Select up to {num_clips} engaging vertical Short clips from this stream transcript.\n"
-            f"Rules:\n"
-            f"1. Each clip MUST start on a strong hook/setup and end on a complete payoff/punchline/resolution (do not cut mid-thought).\n"
-            f"2. Each clip duration MUST be between {min_len} and {max_len} seconds (strictly <= {max_len}s).\n"
-            f"3. Return ONLY a JSON list: [{{\"start\": 120, \"end\": 162, \"reason\": \"hook + payoff\"}}].\n\n"
-            f"Transcript:\n{compact}"
+            f"You are an expert short-form video editor. Pick up to {num_clips} viral-worthy clips from this stream transcript.\n"
+            f"Strict rules:\n"
+            f"1. Every clip MUST open with a clear HOOK (curiosity, shock, bold statement, question, or intense moment) and stay through the PAYOFF/ENDING (punchline, result, or resolution—never cut mid-thought).\n"
+            f"2. Each clip duration MUST be between {min_len} and {max_len} seconds (NEVER exceed {max_len}s, and avoid short fragmented cuts).\n"
+            f"3. Return ONLY a valid JSON array: [{\"start\": 120, \"end\": 164, \"title\": \"Short title\", \"reason\": \"Why hook + ending works\"}].\n\n"
+            f"Transcript:\n{transcript_lines}"
         )
 
-        order = []
-        if provider == "auto":
-            if claude_key:
-                order.append("claude")
-            order.append("ollama")
-            if groq_key:
-                order.append("groq")
-            if gemini_key:
-                order.append("gemini")
-        elif provider != "heuristic":
-            order.append(provider)
+    order = []
+    if provider == "auto":
+        if groq_key:
+            order.append("groq")
+        if gemini_key:
+            order.append("gemini")
+        order.append("ollama")
+    elif provider != "heuristic":
+        order.append(provider)
 
-        for target in order:
+    if prompt:
+        for p in order:
             try:
-                if target == "claude":
-                    if not claude_key:
-                        raise RuntimeError("ANTHROPIC_API_KEY not set")
-                    print(f"  -> Asking Claude ({claude_model}) for hook-to-payoff segments...")
-                    txt = _call_claude(prompt, claude_model, claude_key)
-                elif target == "ollama":
-                    print(f"  -> Asking Ollama ({ollama_model}) for hook-to-payoff segments...")
-                    txt = _call_ollama(prompt, ollama_model, ollama_host)
-                elif target == "groq":
+                if p == "groq":
                     if not groq_key:
-                        raise RuntimeError("GROQ_API_KEY not set")
-                    resp = requests.post(
+                        continue
+                    print("  -> Selecting hook+payoff clips via Groq free API (llama-3.3-70b-versatile)...")
+                    r = requests.post(
                         "https://api.groq.com/openai/v1/chat/completions",
                         headers={"Authorization": f"Bearer {groq_key}", "Content-Type": "application/json"},
-                        json={"model": "llama-3.3-70b-versatile", "messages": [{"role": "user", "content": prompt}], "temperature": 0.3},
+                        json={
+                            "model": "llama-3.3-70b-versatile",
+                            "messages": [{"role": "user", "content": prompt}],
+                            "temperature": 0.35,
+                        },
                         timeout=60,
                     )
-                    resp.raise_for_status()
-                    txt = resp.json()["choices"][0]["message"]["content"]
-                elif target == "gemini":
+                    r.raise_for_status()
+                    txt = r.json()["choices"][0]["message"]["content"]
+                elif p == "gemini":
                     if not gemini_key:
-                        raise RuntimeError("GEMINI_API_KEY not set")
-                    resp = requests.post(
-                        f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={gemini_key}",
+                        continue
+                    print("  -> Selecting hook+payoff clips via Google AI Studio free API (gemini-3.8-flash)...")
+                    r = requests.post(
+                        f"https://generativelanguage.googleapis.com/v1beta/models/gemini-3.8-flash:generateContent?key={gemini_key}",
                         json={"contents": [{"parts": [{"text": prompt}]}]},
                         timeout=60,
                     )
-                    resp.raise_for_status()
-                    txt = resp.json()["candidates"][0]["content"]["parts"][0]["text"]
+                    r.raise_for_status()
+                    txt = r.json()["candidates"][0]["content"]["parts"][0]["text"]
+                elif p == "ollama":
+                    print(f"  -> Selecting hook+payoff clips via local/Colab Ollama ({ollama_model})...")
+                    r = requests.post(
+                        "http://127.0.0.1:11434/api/generate",
+                        json={"model": ollama_model, "prompt": prompt, "stream": False, "options": {"temperature": 0.35}},
+                        timeout=240,
+                    )
+                    r.raise_for_status()
+                    txt = r.json().get("response", "")
                 else:
                     continue
 
-                parsed = _parse_clips_json(txt, num_clips, min_len, max_len, duration)
+                parsed = _parse_ai_clips(txt, num_clips, min_len, max_len, duration, segments)
                 if parsed:
-                    print(f"  -> Selected {len(parsed)} clips via {target}.")
                     return parsed
             except Exception as e:
-                print(f"  -> {target} skipped ({e})")
+                print(f"  -> {p} skipped ({e})")
 
-        # Hook-to-payoff window builder fallback
-        hook_words = re.compile(r"\b(what|why|how|wait|bro|no way|crazy|secret|insane|look|watch|never|mistake|truth|caught)\b", re.I)
-        candidates = []
+    # Hook + payoff heuristic fallback (works with or without transcript)
+    candidates = []
+    if segments:
+        hook_re = re.compile(r"\b(wait|what|why|how|no way|bro|crazy|insane|look|watch|secret|never|caught|mistake|truth)\b", re.I)
         for i, seg in enumerate(segments):
-            hook_bonus = 25.0 if hook_words.search(seg["text"]) else 0.0
-            start = max(0.0, seg["start"] - 1.5)
-            end = start
-            text_acc = []
-            for j in range(i, len(segments)):
-                nxt_end = min(segments[j]["end"] + 1.0, start + max_len)
-                if nxt_end - start > max_len:
-                    break
-                end = nxt_end
-                text_acc.append(segments[j]["text"])
-                if (end - start) >= min_len and re.search(r"[.!?]$", segments[j]["text"].strip()):
-                    break
-            if (end - start) < min_len:
-                end = min(duration, start + min_len)
-            score = hook_bonus + min(30.0, len(" ".join(text_acc).split()) * 0.5)
-            candidates.append((score, start, end))
+            b_idx = int(seg["start"] // 10)
+            signal_boost = (
+                (0.45 * min(100.0, chat_scores.get(b_idx, 0) * 5.0))
+                + (0.35 * min(100.0, motion_scores.get(b_idx, 0) * 4.0))
+                + (0.20 * min(100.0, audio_scores.get(b_idx, 0)))
+            )
+            hook_score = 35.0 if hook_re.search(seg["text"]) else 5.0
+            st, en = _snap_to_hook_and_payoff(segments, seg["start"] - 1.0, seg["start"] + max_len, min_len, max_len, duration)
+            candidates.append((hook_score + signal_boost, st, en, seg["text"][:60]))
+    else:
+        combined = defaultdict(float)
+        for b, v in audio_scores.items():
+            combined[b] += v * 0.45
+        for b, v in motion_scores.items():
+            combined[b] += v * 0.35
+        for b, v in chat_scores.items():
+            combined[b] += v * 0.20
+        for b, sc in sorted(combined.items(), key=lambda x: x[1], reverse=True):
+            st, en = _snap_to_hook_and_payoff([], max(0.0, (b * 10) - 5.0), (b * 10) + max_len, min_len, max_len, duration)
+            candidates.append((sc, st, en, f"Peak moment at {int(st)}s"))
 
-        candidates.sort(reverse=True)
-        picked = []
-        for sc, st, en in candidates:
-            if any(abs(st - p_st) < max_len for p_st, _, _ in picked):
-                continue
-            picked.append((st, en, f"Heuristic {sc:.0f}"))
-            if len(picked) >= num_clips:
-                break
-        picked.sort()
-        return picked
+    candidates.sort(key=lambda x: x[0], reverse=True)
+    picked = []
+    for sc, st, en, label in candidates:
+        if any(abs(st - p["start"]) < max_len for p in picked):
+            continue
+        picked.append({
+            "start": st,
+            "end": en,
+            "duration": round(en - st, 1),
+            "title": label,
+            "reason": f"Hook + payoff window (score {sc:.1f})",
+        })
+        if len(picked) >= num_clips:
+            break
+    picked.sort(key=lambda x: x["start"])
+    return picked
 
-    return []
+def render_clip(url, idx, start, end, raw_dir, shorts_dir, cookies=None, split_cam=False):
+    raw_path = os.path.join(raw_dir, f"raw_{idx:03d}.mp4")
+    final_path = os.path.join(shorts_dir, f"short_{idx:03d}.mp4")
 
-def render_clip(url, idx, start, end, out_dir, cookies=None, split_cam=False):
-    raw_path = os.path.join(out_dir, "raw", f"raw_{idx:03d}.mp4")
-    final_path = os.path.join(out_dir, "final_shorts", f"short_{idx:03d}.mp4")
+    if os.path.exists(final_path) and os.path.getsize(final_path) > 0:
+        return final_path
+
     section = f"*{int(start)}-{int(end)}"
-
     dl_cmd = [
         py_cmd(), "-m", "yt_dlp", "--download-sections", section, "--force-keyframes-at-cuts",
         "-f", "bestvideo[height<=1080][ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]",
@@ -300,7 +342,7 @@ def render_clip(url, idx, start, end, out_dir, cookies=None, split_cam=False):
     dl_cmd.append(url)
     subprocess.run(dl_cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     if not os.path.exists(raw_path):
-        return False
+        return None
 
     if split_cam:
         vf = (
@@ -318,81 +360,106 @@ def render_clip(url, idx, start, end, out_dir, cookies=None, split_cam=False):
         )
 
     for encoder, extra in [
-        ("h264_qsv", ["-b:v", "5M"]),
         ("h264_nvenc", ["-preset", "p4", "-cq", "23"]),
+        ("h264_qsv", ["-b:v", "5M"]),
         ("libx264", ["-preset", "ultrafast", "-crf", "23"]),
     ]:
         ff_cmd = ["ffmpeg", "-y", "-i", raw_path, "-vf", vf, "-c:v", encoder, *extra, "-c:a", "copy", final_path]
         r = subprocess.run(ff_cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        if r.returncode == 0 and os.path.exists(final_path):
-            return True
-    return False
+        if r.returncode == 0 and os.path.exists(final_path) and os.path.getsize(final_path) > 0:
+            return final_path
+    return None
+
+def write_reports(session_dir, title, url, rows):
+    trans_dir = os.path.join(session_dir, "transcript")
+    rep_dir = os.path.join(session_dir, "report")
+    os.makedirs(trans_dir, exist_ok=True)
+    os.makedirs(rep_dir, exist_ok=True)
+
+    json_path = os.path.join(trans_dir, "clips.json")
+    csv_path = os.path.join(trans_dir, "clips.csv")
+    html_path = os.path.join(rep_dir, "index.html")
+
+    with open(json_path, "w", encoding="utf-8") as f:
+        json.dump(rows, f, indent=2)
+
+    with open(csv_path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=["clip", "start", "end", "duration", "title", "reason", "file"])
+        writer.writeheader()
+        writer.writerows(rows)
+
+    trs = "\n".join(
+        f"<tr><td>{r['clip']}</td><td>{r['start']}s - {r['end']}s</td><td>{r['duration']}s</td><td>{r['title']}</td><td>{r['reason']}</td><td>{r['file']}</td></tr>"
+        for r in rows
+    )
+    html = (
+        f"<!doctype html><html><head><meta charset='utf-8'><title>StreamClipper Report - {title}</title>"
+        f"<style>body{{font-family:sans-serif;background:#0f1115;color:#eee;padding:24px}}table{{width:100%;border-collapse:collapse}}th,td{{border:1px solid #2b303c;padding:8px;text-align:left}}th{{background:#1b202b}}</style></head>"
+        f"<body><h1>{title}</h1><p>Source: {url}</p><table><thead><tr><th>#</th><th>Range</th><th>Duration</th><th>Hook/Title</th><th>Payoff Reason</th><th>Output File</th></tr></thead><tbody>{trs}</tbody></table></body></html>"
+    )
+    with open(html_path, "w", encoding="utf-8") as f:
+        f.write(html)
 
 def main():
-    parser = argparse.ArgumentParser(description="Hook + Payoff Vertical Shorts Clipper (Max 50s)")
-    parser.add_argument("url", help="YouTube or Twitch stream/video URL")
+    parser = argparse.ArgumentParser(description="StreamClipper Hook + Payoff Vertical Shorts Generator (Max 50s)")
+    parser.add_argument("url", help="YouTube, Twitch, or Kick stream/VOD URL")
     parser.add_argument("--clips", type=int, default=40)
     parser.add_argument("--min-len", type=int, default=25)
     parser.add_argument("--max-len", type=int, default=50)
-    parser.add_argument("--out", default=".")
+    parser.add_argument("--out", default="StreamClipper")
     parser.add_argument("--cookies", default=None)
     parser.add_argument("--chat-box", choices=["left", "right", "none"], default="right")
     parser.add_argument("--split-cam", action="store_true")
-    parser.add_argument("--ai-provider", choices=["auto", "claude", "ollama", "groq", "gemini", "heuristic"], default="auto")
-    parser.add_argument("--claude-model", default="claude-fable-5-2")
+    parser.add_argument("--ai-provider", choices=["auto", "groq", "gemini", "ollama", "heuristic"], default="auto")
     parser.add_argument("--ollama-model", default="qwen3.5:9b")
-    parser.add_argument("--ollama-host", default="http://127.0.0.1:11434")
     args = parser.parse_args()
 
     max_len = min(args.max_len, 50)
     min_len = min(args.min_len, max_len)
 
-    os.makedirs(os.path.join(args.out, "raw"), exist_ok=True)
-    os.makedirs(os.path.join(args.out, "final_shorts"), exist_ok=True)
-
     meta = get_metadata(args.url, args.cookies)
+    title = meta.get("title") or "Stream"
     duration = float(meta.get("duration") or 36000)
-    print(f"Loaded: {meta.get('title')} ({int(duration // 60)} mins) | Target length: {min_len}s-{max_len}s")
+    session_id = hashlib.md5(f"{args.url}|{min_len}|{max_len}".encode()).hexdigest()[:10]
+    session_dir = os.path.join(args.out, session_id)
 
-    audio_path = download_audio(args.url, "temp_audio.m4a", args.cookies)
-    segments = transcribe_segments(audio_path) if audio_path else []
+    raw_dir = os.path.join(session_dir, "raw")
+    shorts_dir = os.path.join(session_dir, "shorts")
+    trans_dir = os.path.join(session_dir, "transcript")
+    os.makedirs(raw_dir, exist_ok=True)
+    os.makedirs(shorts_dir, exist_ok=True)
+    os.makedirs(trans_dir, exist_ok=True)
+
+    print(f"Stream: {title} ({int(duration // 60)}m) | Folder: {session_dir} | Length: {min_len}s-{max_len}s")
+
+    audio_path = download_audio(args.url, os.path.join(raw_dir, "source_audio.m4a"), args.cookies)
+    cache_json = os.path.join(trans_dir, "transcript.json")
+    segments = transcribe_segments(audio_path, cache_json) if audio_path else []
     audio_scores = score_audio_variation(audio_path)
-    if audio_path and os.path.exists(audio_path):
-        os.remove(audio_path)
-
     chat_scores, motion_scores = score_chat_and_motion(args.url, duration, args.chat_box, args.cookies)
 
-    print("[4/4] Selecting hook-to-payoff clips...")
-    clips = select_hook_to_payoff_clips(
-        segments, args.clips, min_len, max_len, duration,
-        args.ai_provider, args.claude_model, args.ollama_model, args.ollama_host
+    print("[4/4] Selecting hook-to-payoff clips (<= 50s)...")
+    selected = select_clips(
+        segments, audio_scores, chat_scores, motion_scores, duration,
+        args.clips, min_len, max_len, args.ai_provider, args.ollama_model
     )
 
-    if not clips:
-        combined = defaultdict(float)
-        for b, v in audio_scores.items():
-            combined[b] += v * 0.45
-        for b, v in motion_scores.items():
-            combined[b] += v * 0.35
-        for b, v in chat_scores.items():
-            combined[b] += v * 0.20
-        ranked = sorted(combined.items(), key=lambda x: x[1], reverse=True)
-        for b, sc in ranked:
-            st = max(0.0, (b * 10) - 5.0)
-            en = min(duration, st + min(max_len, max(min_len, 40)))
-            if any(abs(st - p_st) < max_len for p_st, _, _ in clips):
-                continue
-            clips.append((st, en, f"Energy {sc:.1f}"))
-            if len(clips) >= args.clips:
-                break
-        clips.sort()
+    rows = []
+    for i, c in enumerate(selected, 1):
+        print(f"[{i}/{len(selected)}] {c['start']}s -> {c['end']}s ({c['duration']}s) | {c['title']}")
+        out_mp4 = render_clip(args.url, i, c["start"], c["end"], raw_dir, shorts_dir, args.cookies, args.split_cam)
+        rows.append({
+            "clip": i,
+            "start": c["start"],
+            "end": c["end"],
+            "duration": c["duration"],
+            "title": c["title"],
+            "reason": c["reason"],
+            "file": os.path.basename(out_mp4) if out_mp4 else "FAILED",
+        })
 
-    for idx, (st, en, info) in enumerate(clips, 1):
-        en = min(duration, st + min(max_len, max(min_len, en - st)))
-        print(f"[{idx}/{len(clips)}] {int(st)}s -> {int(en)}s ({int(en - st)}s) | {info}")
-        render_clip(args.url, idx, st, en, args.out, args.cookies, args.split_cam)
-
-    print("\nDONE! Check final_shorts for complete hook-to-payoff vertical videos (<= 50s).")
+    write_reports(session_dir, title, args.url, rows)
+    print(f"\nDONE! Clips & report saved in: {session_dir}")
 
 if __name__ == "__main__":
     main()
