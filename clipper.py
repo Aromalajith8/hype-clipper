@@ -28,7 +28,6 @@ def download_audio(url, out_path="temp_audio.m4a", cookies=None):
     return out_path if os.path.exists(out_path) else None
 
 def transcribe_segments(audio_path):
-    """Fast Whisper transcription with timestamps so we can snap clips to hooks & endings."""
     print("[1/4] Transcribing speech with faster-whisper...")
     try:
         from faster_whisper import WhisperModel
@@ -44,7 +43,7 @@ def transcribe_segments(audio_path):
         print(f"  -> Captured {len(out)} speech segments on {device.upper()}.")
         return out
     except Exception as e:
-        print(f"  -> Whisper skipped ({e}); using audio + chat scoring.")
+        print(f"  -> Whisper skipped ({e}); using signal scoring.")
         return []
 
 def score_audio_variation(audio_path, bucket_sec=10):
@@ -133,61 +132,126 @@ def score_chat_and_motion(url, duration, chat_side="right", cookies=None, bucket
 
     return chat_buckets, motion_buckets
 
-def ai_select_hook_to_payoff_clips(segments, num_clips, min_len, max_len):
-    """Uses free Groq or Gemini API if key is set; otherwise builds complete hook-to-payoff windows."""
+def _parse_clips_json(content, num_clips, min_len, max_len, duration):
+    match = re.search(r"\[[\s\S]*\]", content)
+    if not match:
+        return []
+    raw_clips = json.loads(match.group(0))
+    valid = []
+    for c in raw_clips:
+        st = max(0.0, float(c.get("start", 0)))
+        en = float(c.get("end", 0))
+        dur = en - st
+        if dur < min_len:
+            en = st + min_len
+        elif dur > max_len:
+            en = st + max_len
+        en = min(duration, en)
+        if en - st >= 5:
+            valid.append((st, en, c.get("reason", "AI hook + payoff")))
+    return valid[:num_clips]
+
+def _call_claude(prompt, model_name, api_key):
+    resp = requests.post(
+        "https://api.anthropic.com/v1/messages",
+        headers={
+            "x-api-key": api_key,
+            "anthropic-version": "2023-06-01",
+            "content-type": "application/json",
+        },
+        json={
+            "model": model_name,
+            "max_tokens": 2048,
+            "temperature": 0.3,
+            "messages": [{"role": "user", "content": prompt}],
+        },
+        timeout=90,
+    )
+    resp.raise_for_status()
+    blocks = resp.json().get("content", [])
+    return "\n".join(b.get("text", "") for b in blocks if b.get("type") == "text")
+
+def _call_ollama(prompt, model_name, host="http://127.0.0.1:11434"):
+    resp = requests.post(
+        f"{host.rstrip('/')}/api/generate",
+        json={"model": model_name, "prompt": prompt, "stream": False, "options": {"temperature": 0.3}},
+        timeout=300,
+    )
+    resp.raise_for_status()
+    return resp.json().get("response", "")
+
+def select_hook_to_payoff_clips(segments, num_clips, min_len, max_len, duration, provider, claude_model, ollama_model, ollama_host):
+    claude_key = os.environ.get("ANTHROPIC_API_KEY", "").strip()
     groq_key = os.environ.get("GROQ_API_KEY", "").strip()
     gemini_key = os.environ.get("GEMINI_API_KEY", "").strip()
 
-    if segments and (groq_key or gemini_key):
+    if segments:
         compact = "\n".join(
             f"[{int(s['start'])}s-{int(s['end'])}s] {s['text']}" for s in segments[:600]
         )
         prompt = (
-            f"Select up to {num_clips} engaging Short-form video clips from this transcript.\n"
+            f"Select up to {num_clips} engaging vertical Short clips from this stream transcript.\n"
             f"Rules:\n"
-            f"1. Each clip MUST start on a strong hook/setup line and end on a complete payoff/punchline/resolution (never cut mid-sentence).\n"
+            f"1. Each clip MUST start on a strong hook/setup and end on a complete payoff/punchline/resolution (do not cut mid-thought).\n"
             f"2. Each clip duration MUST be between {min_len} and {max_len} seconds (strictly <= {max_len}s).\n"
-            f"3. Return ONLY a JSON list of objects: [{\"start\": 120, \"end\": 162, \"reason\": \"...\"}].\n\n"
+            f"3. Return ONLY a JSON list: [{{\"start\": 120, \"end\": 162, \"reason\": \"hook + payoff\"}}].\n\n"
             f"Transcript:\n{compact}"
         )
-        try:
+
+        order = []
+        if provider == "auto":
+            if claude_key:
+                order.append("claude")
+            order.append("ollama")
             if groq_key:
-                resp = requests.post(
-                    "https://api.groq.com/openai/v1/chat/completions",
-                    headers={"Authorization": f"Bearer {groq_key}", "Content-Type": "application/json"},
-                    json={"model": "llama-3.3-70b-versatile", "messages": [{"role": "user", "content": prompt}], "temperature": 0.3},
-                    timeout=45
-                )
-                content = resp.json()["choices"][0]["message"]["content"]
-            else:
-                resp = requests.post(
-                    f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={gemini_key}",
-                    json={"contents": [{"parts": [{"text": prompt}]}]},
-                    timeout=45
-                )
-                content = resp.json()["candidates"][0]["content"]["parts"][0]["text"]
+                order.append("groq")
+            if gemini_key:
+                order.append("gemini")
+        elif provider != "heuristic":
+            order.append(provider)
 
-            match = re.search(r"\[[\s\S]*\]", content)
-            if match:
-                raw_clips = json.loads(match.group(0))
-                valid = []
-                for c in raw_clips:
-                    st = float(c.get("start", 0))
-                    en = float(c.get("end", 0))
-                    dur = en - st
-                    if dur < min_len:
-                        en = st + min_len
-                    elif dur > max_len:
-                        en = st + max_len
-                    valid.append((st, en, c.get("reason", "AI hook + payoff")))
-                if valid:
-                    print(f"  -> AI selected {len(valid)} hook-to-payoff clips ({min_len}s-{max_len}s).")
-                    return valid[:num_clips]
-        except Exception as e:
-            print(f"  -> AI API fallback ({e}); using transcript + energy window builder.")
+        for target in order:
+            try:
+                if target == "claude":
+                    if not claude_key:
+                        raise RuntimeError("ANTHROPIC_API_KEY not set")
+                    print(f"  -> Asking Claude ({claude_model}) for hook-to-payoff segments...")
+                    txt = _call_claude(prompt, claude_model, claude_key)
+                elif target == "ollama":
+                    print(f"  -> Asking Ollama ({ollama_model}) for hook-to-payoff segments...")
+                    txt = _call_ollama(prompt, ollama_model, ollama_host)
+                elif target == "groq":
+                    if not groq_key:
+                        raise RuntimeError("GROQ_API_KEY not set")
+                    resp = requests.post(
+                        "https://api.groq.com/openai/v1/chat/completions",
+                        headers={"Authorization": f"Bearer {groq_key}", "Content-Type": "application/json"},
+                        json={"model": "llama-3.3-70b-versatile", "messages": [{"role": "user", "content": prompt}], "temperature": 0.3},
+                        timeout=60,
+                    )
+                    resp.raise_for_status()
+                    txt = resp.json()["choices"][0]["message"]["content"]
+                elif target == "gemini":
+                    if not gemini_key:
+                        raise RuntimeError("GEMINI_API_KEY not set")
+                    resp = requests.post(
+                        f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={gemini_key}",
+                        json={"contents": [{"parts": [{"text": prompt}]}]},
+                        timeout=60,
+                    )
+                    resp.raise_for_status()
+                    txt = resp.json()["candidates"][0]["content"]["parts"][0]["text"]
+                else:
+                    continue
 
-    # Structured hook-to-payoff window builder (no API key needed)
-    if segments:
+                parsed = _parse_clips_json(txt, num_clips, min_len, max_len, duration)
+                if parsed:
+                    print(f"  -> Selected {len(parsed)} clips via {target}.")
+                    return parsed
+            except Exception as e:
+                print(f"  -> {target} skipped ({e})")
+
+        # Hook-to-payoff window builder fallback
         hook_words = re.compile(r"\b(what|why|how|wait|bro|no way|crazy|secret|insane|look|watch|never|mistake|truth|caught)\b", re.I)
         candidates = []
         for i, seg in enumerate(segments):
@@ -201,11 +265,10 @@ def ai_select_hook_to_payoff_clips(segments, num_clips, min_len, max_len):
                     break
                 end = nxt_end
                 text_acc.append(segments[j]["text"])
-                # Stop at a natural sentence boundary once minimum duration is reached
                 if (end - start) >= min_len and re.search(r"[.!?]$", segments[j]["text"].strip()):
                     break
             if (end - start) < min_len:
-                end = start + min_len
+                end = min(duration, start + min_len)
             score = hook_bonus + min(30.0, len(" ".join(text_acc).split()) * 0.5)
             candidates.append((score, start, end))
 
@@ -214,7 +277,7 @@ def ai_select_hook_to_payoff_clips(segments, num_clips, min_len, max_len):
         for sc, st, en in candidates:
             if any(abs(st - p_st) < max_len for p_st, _, _ in picked):
                 continue
-            picked.append((st, en, f"Score {sc:.0f}"))
+            picked.append((st, en, f"Heuristic {sc:.0f}"))
             if len(picked) >= num_clips:
                 break
         picked.sort()
@@ -268,13 +331,17 @@ def render_clip(url, idx, start, end, out_dir, cookies=None, split_cam=False):
 def main():
     parser = argparse.ArgumentParser(description="Hook + Payoff Vertical Shorts Clipper (Max 50s)")
     parser.add_argument("url", help="YouTube or Twitch stream/video URL")
-    parser.add_argument("--clips", type=int, default=40, help="Number of clips (default: 40)")
-    parser.add_argument("--min-len", type=int, default=25, help="Minimum clip seconds (default: 25)")
-    parser.add_argument("--max-len", type=int, default=50, help="Maximum clip seconds (default: 50)")
-    parser.add_argument("--out", default=".", help="Output folder")
-    parser.add_argument("--cookies", default=None, help="Path to cookies.txt")
+    parser.add_argument("--clips", type=int, default=40)
+    parser.add_argument("--min-len", type=int, default=25)
+    parser.add_argument("--max-len", type=int, default=50)
+    parser.add_argument("--out", default=".")
+    parser.add_argument("--cookies", default=None)
     parser.add_argument("--chat-box", choices=["left", "right", "none"], default="right")
     parser.add_argument("--split-cam", action="store_true")
+    parser.add_argument("--ai-provider", choices=["auto", "claude", "ollama", "groq", "gemini", "heuristic"], default="auto")
+    parser.add_argument("--claude-model", default="claude-fable-5-2")
+    parser.add_argument("--ollama-model", default="qwen3.5:9b")
+    parser.add_argument("--ollama-host", default="http://127.0.0.1:11434")
     args = parser.parse_args()
 
     max_len = min(args.max_len, 50)
@@ -296,9 +363,11 @@ def main():
     chat_scores, motion_scores = score_chat_and_motion(args.url, duration, args.chat_box, args.cookies)
 
     print("[4/4] Selecting hook-to-payoff clips...")
-    clips = ai_select_hook_to_payoff_clips(segments, args.clips, min_len, max_len)
+    clips = select_hook_to_payoff_clips(
+        segments, args.clips, min_len, max_len, duration,
+        args.ai_provider, args.claude_model, args.ollama_model, args.ollama_host
+    )
 
-    # Fallback if transcript was empty (e.g., pure gameplay/music)
     if not clips:
         combined = defaultdict(float)
         for b, v in audio_scores.items():
