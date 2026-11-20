@@ -147,7 +147,6 @@ def score_chat_and_motion(url, duration, chat_side="right", cookies=None, bucket
     return chat_buckets, motion_buckets
 
 def _snap_to_hook_and_payoff(segments, start_sec, end_sec, min_len, max_len, duration):
-    """Snaps a candidate window so it opens on a hook and holds through a sentence/payoff end."""
     start = max(0.0, float(start_sec))
     end = min(float(duration), float(end_sec))
     if end - start < min_len:
@@ -160,13 +159,11 @@ def _snap_to_hook_and_payoff(segments, start_sec, end_sec, min_len, max_len, dur
 
     hook_re = re.compile(r"\b(wait|what|why|how|no way|bro|crazy|insane|look|watch|secret|never|caught|mistake|truth)\b", re.I)
 
-    # Pull start back slightly toward a hook line if within 8s
     for s in reversed(segments):
         if start - 8.0 <= s["start"] <= start + 2.0 and hook_re.search(s["text"]):
             start = max(0.0, s["start"] - 1.0)
             break
 
-    # Extend end forward up to max_len until a natural sentence boundary (. ! ?) so payoff isn't cut
     best_end = min(float(duration), start + max_len, max(end, start + min_len))
     for s in segments:
         if s["end"] < start + min_len:
@@ -219,7 +216,7 @@ def select_clips(segments, audio_scores, chat_scores, motion_scores, duration, n
             f"Strict rules:\n"
             f"1. Every clip MUST open with a clear HOOK (curiosity, shock, bold statement, question, or intense moment) and stay through the PAYOFF/ENDING (punchline, result, or resolution—never cut mid-thought).\n"
             f"2. Each clip duration MUST be between {min_len} and {max_len} seconds (NEVER exceed {max_len}s, and avoid short fragmented cuts).\n"
-            f"3. Return ONLY a valid JSON array: [{\"start\": 120, \"end\": 164, \"title\": \"Short title\", \"reason\": \"Why hook + ending works\"}].\n\n"
+            f"3. Return ONLY a valid JSON array: [{{\"start\": 120, \"end\": 164, \"title\": \"Short title\", \"reason\": \"Why hook + ending works\"}}].\n\n"
             f"Transcript:\n{transcript_lines}"
         )
 
@@ -264,7 +261,7 @@ def select_clips(segments, audio_scores, chat_scores, motion_scores, duration, n
                     r.raise_for_status()
                     txt = r.json()["candidates"][0]["content"]["parts"][0]["text"]
                 elif p == "ollama":
-                    print(f"  -> Selecting hook+payoff clips via local/Colab Ollama ({ollama_model})...")
+                    print(f"  -> Selecting hook+payoff clips via Ollama ({ollama_model})...")
                     r = requests.post(
                         "http://127.0.0.1:11434/api/generate",
                         json={"model": ollama_model, "prompt": prompt, "stream": False, "options": {"temperature": 0.35}},
@@ -281,11 +278,10 @@ def select_clips(segments, audio_scores, chat_scores, motion_scores, duration, n
             except Exception as e:
                 print(f"  -> {p} skipped ({e})")
 
-    # Hook + payoff heuristic fallback (works with or without transcript)
     candidates = []
     if segments:
         hook_re = re.compile(r"\b(wait|what|why|how|no way|bro|crazy|insane|look|watch|secret|never|caught|mistake|truth)\b", re.I)
-        for i, seg in enumerate(segments):
+        for seg in segments:
             b_idx = int(seg["start"] // 10)
             signal_boost = (
                 (0.45 * min(100.0, chat_scores.get(b_idx, 0) * 5.0))
@@ -324,9 +320,77 @@ def select_clips(segments, audio_scores, chat_scores, motion_scores, duration, n
     picked.sort(key=lambda x: x["start"])
     return picked
 
-def render_clip(url, idx, start, end, raw_dir, shorts_dir, cookies=None, split_cam=False):
+def _fmt_ass_time(sec):
+    sec = max(0.0, float(sec))
+    h = int(sec // 3600)
+    m = int((sec % 3600) // 60)
+    s = sec % 60
+    return f"{h}:{m:02d}:{s:05.2f}"
+
+def _escape_ass_text(txt):
+    txt = txt.replace("{", "(").replace("}", ")")
+    return re.sub(r"\s+", " ", txt).strip()
+
+def build_ass_subtitles(segments, clip_start, clip_end, ass_path, style_mode):
+    """Generates a styled .ass subtitle file aligned to [clip_start, clip_end]."""
+    clip_segs = [
+        s for s in (segments or [])
+        if s["end"] > clip_start and s["start"] < clip_end and s["text"].strip()
+    ]
+    if not clip_segs:
+        return None
+
+    if style_mode == "bold_shorts":
+        # Centered bold Shorts captions (Alignment=5 = middle-center, above bottom UI)
+        font_name, font_size, bold, alignment, margin_v = "Arial", 64, -1, 5, 120
+        primary, outline, back = "&H0000FFFF", "&H00000000", "&H80000000"
+    else:
+        # Clean lower-third subtitles (Alignment=2 = bottom-center)
+        font_name, font_size, bold, alignment, margin_v = "Arial", 48, 0, 2, 180
+        primary, outline, back = "&H00FFFFFF", "&H00000000", "&H64000000"
+
+    header = (
+        "[Script Info]\n"
+        "ScriptType: v4.00+\n"
+        "PlayResX: 1080\n"
+        "PlayResY: 1920\n\n"
+        "[V4+ Styles]\n"
+        "Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, "
+        "Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, "
+        "Alignment, MarginL, MarginR, MarginV, Encoding\n"
+        f"Style: Default,{font_name},{font_size},{primary},&H000000FF,{outline},{back},"
+        f"{bold},0,0,0,100,100,0,0,1,3,1,{alignment},60,60,{margin_v},1\n\n"
+        "[Events]\n"
+        "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n"
+    )
+
+    events = []
+    for s in clip_segs:
+        rel_st = max(0.0, s["start"] - clip_start)
+        rel_en = min(clip_end - clip_start, s["end"] - clip_start)
+        if rel_en - rel_st < 0.25:
+            continue
+        words = _escape_ass_text(s["text"]).split()
+        # Chunk into short readable phrases (up to 5 words)
+        chunk_size = 4 if style_mode == "bold_shorts" else 6
+        chunks = [" ".join(words[i:i+chunk_size]) for i in range(0, len(words), chunk_size)]
+        chunk_dur = (rel_en - rel_st) / max(1, len(chunks))
+        for idx_c, ch in enumerate(chunks):
+            c_st = rel_st + (idx_c * chunk_dur)
+            c_en = min(rel_en, c_st + chunk_dur)
+            events.append(f"Dialogue: 0,{_fmt_ass_time(c_st)},{_fmt_ass_time(c_en)},Default,,0,0,0,,{ch}")
+
+    if not events:
+        return None
+
+    with open(ass_path, "w", encoding="utf-8") as f:
+        f.write(header + "\n".join(events) + "\n")
+    return ass_path
+
+def render_clip(url, idx, start, end, raw_dir, shorts_dir, segments=None, subtitles="none", cookies=None, split_cam=False):
     raw_path = os.path.join(raw_dir, f"raw_{idx:03d}.mp4")
     final_path = os.path.join(shorts_dir, f"short_{idx:03d}.mp4")
+    ass_path = os.path.join(raw_dir, f"sub_{idx:03d}.ass")
 
     if os.path.exists(final_path) and os.path.getsize(final_path) > 0:
         return final_path
@@ -358,6 +422,12 @@ def render_clip(url, idx, start, end, raw_dir, shorts_dir, cookies=None, split_c
             "[orig]scale=1080:-1[fg];"
             "[blurred][fg]overlay=(W-w)/2:(H-h)/2"
         )
+
+    if subtitles != "none":
+        built_ass = build_ass_subtitles(segments, start, end, ass_path, subtitles)
+        if built_ass:
+            escaped_path = os.path.abspath(built_ass).replace("\\", "/").replace(":", "\\:")
+            vf = f"{vf},ass='{escaped_path}'"
 
     for encoder, extra in [
         ("h264_nvenc", ["-preset", "p4", "-cq", "23"]),
@@ -410,6 +480,7 @@ def main():
     parser.add_argument("--cookies", default=None)
     parser.add_argument("--chat-box", choices=["left", "right", "none"], default="right")
     parser.add_argument("--split-cam", action="store_true")
+    parser.add_argument("--subtitles", choices=["none", "clean", "bold_shorts"], default="bold_shorts")
     parser.add_argument("--ai-provider", choices=["auto", "groq", "gemini", "ollama", "heuristic"], default="auto")
     parser.add_argument("--ollama-model", default="qwen3.5:9b")
     args = parser.parse_args()
@@ -420,7 +491,7 @@ def main():
     meta = get_metadata(args.url, args.cookies)
     title = meta.get("title") or "Stream"
     duration = float(meta.get("duration") or 36000)
-    session_id = hashlib.md5(f"{args.url}|{min_len}|{max_len}".encode()).hexdigest()[:10]
+    session_id = hashlib.md5(f"{args.url}|{min_len}|{max_len}|{args.subtitles}".encode()).hexdigest()[:10]
     session_dir = os.path.join(args.out, session_id)
 
     raw_dir = os.path.join(session_dir, "raw")
@@ -430,7 +501,7 @@ def main():
     os.makedirs(shorts_dir, exist_ok=True)
     os.makedirs(trans_dir, exist_ok=True)
 
-    print(f"Stream: {title} ({int(duration // 60)}m) | Folder: {session_dir} | Length: {min_len}s-{max_len}s")
+    print(f"Stream: {title} ({int(duration // 60)}m) | Subtitles: {args.subtitles} | Length: {min_len}s-{max_len}s")
 
     audio_path = download_audio(args.url, os.path.join(raw_dir, "source_audio.m4a"), args.cookies)
     cache_json = os.path.join(trans_dir, "transcript.json")
@@ -447,7 +518,10 @@ def main():
     rows = []
     for i, c in enumerate(selected, 1):
         print(f"[{i}/{len(selected)}] {c['start']}s -> {c['end']}s ({c['duration']}s) | {c['title']}")
-        out_mp4 = render_clip(args.url, i, c["start"], c["end"], raw_dir, shorts_dir, args.cookies, args.split_cam)
+        out_mp4 = render_clip(
+            args.url, i, c["start"], c["end"], raw_dir, shorts_dir,
+            segments=segments, subtitles=args.subtitles, cookies=args.cookies, split_cam=args.split_cam
+        )
         rows.append({
             "clip": i,
             "start": c["start"],
