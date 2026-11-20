@@ -1,0 +1,9 @@
+﻿raw/
+final_shorts/
+output/
+temp_*
+*.mp4
+*.m4a
+*.json
+cookies.txt
+__pycache__/
