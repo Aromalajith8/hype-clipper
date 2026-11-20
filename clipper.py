@@ -2,6 +2,16 @@
 from collections import defaultdict
 import requests
 
+CAPTION_STYLES = [
+    "auto", "bold-pop", "beast-bold", "karaoke-highlight",
+    "word-by-word", "two-line-stack", "highlight-box",
+    "neon-glow", "impact-shake", "emoji-pop",
+    "typewriter", "bounce", "gradient-stroke",
+    "comic-burst", "minimal-clean", "gaming-glitch", "none"
+]
+
+HOOK_STYLES = ["bold-box", "outline-glow", "top-bar", "none"]
+
 def py_cmd():
     return "py" if os.name == "nt" else "python3"
 
@@ -15,12 +25,16 @@ def get_metadata(url, cookies=None):
         raise RuntimeError(f"yt-dlp metadata failed:\n{res.stderr}")
     return json.loads(res.stdout)
 
-def download_source_once(url, dest_mp4, cookies=None, max_height=1080):
+def download_source_1080p(url, dest_mp4, cookies=None, min_height=1080):
     if os.path.exists(dest_mp4) and os.path.getsize(dest_mp4) > 1024 * 1024:
         print(f"[1/4] Using cached local source video: {dest_mp4}")
         return dest_mp4
-    print(f"[1/4] Downloading source video once (up to {max_height}p) into fast local storage...")
-    fmt = f"bestvideo[height<={max_height}][ext=mp4]+bestaudio[ext=m4a]/best[height<={max_height}][ext=mp4]/best"
+    print(f"[1/4] Downloading source video (target >= {min_height}p for crisp 1080p Shorts)...")
+    fmt = (
+        f"bestvideo[height>={min_height}][ext=mp4]+bestaudio[ext=m4a]/"
+        f"bestvideo[height>={min_height}]+bestaudio/"
+        f"bestvideo[ext=mp4]+bestaudio[ext=m4a]/best"
+    )
     cmd = [py_cmd(), "-m", "yt_dlp", "-f", fmt, "--merge-output-format", "mp4", "-o", dest_mp4]
     if cookies and os.path.exists(cookies):
         cmd += ["--cookies", cookies]
@@ -147,7 +161,7 @@ def parse_ai_json(text, num_clips, min_len, max_len, duration, segments):
     return out[:num_clips]
 
 def select_clips(segments, audio_scores, duration, num_clips, min_len, max_len, provider, ollama_model):
-    print("[3/4] Selecting hook-to-payoff segments (<= 50s)...")
+    print("[3/4] Selecting hook-to-payoff segments (25s-50s)...")
     groq_key = os.environ.get("GROQ_API_KEY", "").strip()
     gemini_key = os.environ.get("GEMINI_API_KEY", "").strip()
 
@@ -158,7 +172,7 @@ def select_clips(segments, audio_scores, duration, num_clips, min_len, max_len, 
             f"Rules:\n"
             f"1. Start on a strong HOOK and end on a complete PAYOFF/PUNCHLINE/ENDING (never cut mid-thought).\n"
             f"2. Duration MUST be between {min_len} and {max_len} seconds (strictly <= {max_len}s).\n"
-            f"3. Return ONLY a JSON list: [{{\"start\": 120, \"end\": 162, \"title\": \"Title\", \"reason\": \"Hook + payoff\"}}].\n\n"
+            f"3. Return ONLY a JSON list: [{{\"start\": 120, \"end\": 162, \"title\": \"Short Hook Title\", \"reason\": \"Hook + payoff\"}}].\n\n"
             f"Transcript:\n{lines}"
         )
 
@@ -208,7 +222,6 @@ def select_clips(segments, audio_scores, duration, num_clips, min_len, max_len, 
             except Exception as e:
                 print(f"  -> {p} skipped ({e}); using fast hook+payoff scorer.")
 
-    # Fast local hook + payoff + audio scorer
     hook_re = re.compile(r"\b(wait|what|why|how|no way|bro|crazy|insane|look|watch|secret|never|caught|mistake|truth)\b", re.I)
     scored = []
     if segments:
@@ -240,53 +253,96 @@ def _fmt_ass(sec):
     s = sec % 60
     return f"{h}:{m:02d}:{s:05.2f}"
 
-def build_ass(segments, start_s, end_s, ass_path, style_mode):
-    segs = [s for s in (segments or []) if s["end"] > start_s and s["start"] < end_s and s["text"].strip()]
-    if not segs or style_mode == "none":
+def _clean_text(txt):
+    txt = txt.replace("{", "(").replace("}", ")")
+    return re.sub(r"\s+", " ", txt).strip()
+
+def _style_params(style_name):
+    # Returns (font, size, primary_ass_bgr, outline_ass_bgr, back_ass_bgr, bold, border_style, outline, shadow, align, margin_v, chunk_words, mode)
+    table = {
+        "bold-pop":          ("Arial", 66, "&H0000FFFF", "&H00000000", "&H80000000", -1, 1, 4, 2, 5, 110, 3, "phrase"),
+        "beast-bold":        ("Impact", 74, "&H00FFFFFF", "&H00000000", "&H90000000", -1, 1, 5, 3, 5, 90,  2, "phrase"),
+        "karaoke-highlight": ("Arial", 62, "&H0000FF88", "&H00000000", "&H80000000", -1, 1, 3, 1, 5, 120, 4, "phrase"),
+        "word-by-word":      ("Impact", 82, "&H0000FFFF", "&H00000000", "&H00000000", -1, 1, 5, 2, 5, 100, 1, "word"),
+        "two-line-stack":    ("Arial", 56, "&H00FFFFFF", "&H00000000", "&H88000000", -1, 1, 3, 2, 5, 120, 6, "phrase"),
+        "highlight-box":     ("Arial", 58, "&H00000000", "&H0000FFFF", "&HFF00FFFF", -1, 3, 2, 0, 5, 120, 3, "phrase"),
+        "neon-glow":         ("Arial", 64, "&H00FFFF00", "&H00FFAA00", "&H80000000", -1, 1, 4, 3, 5, 120, 3, "phrase"),
+        "impact-shake":      ("Impact", 72, "&H003366FF", "&H00000000", "&H80000000", -1, 1, 4, 2, 5, 100, 2, "phrase"),
+        "emoji-pop":         ("Arial", 62, "&H00FFFFFF", "&H00000000", "&H80000000", -1, 1, 3, 2, 5, 120, 3, "emoji"),
+        "typewriter":        ("Courier New", 54, "&H00FFFFFF", "&H00000000", "&H88000000", -1, 1, 2, 1, 5, 130, 1, "word"),
+        "bounce":            ("Arial", 66, "&H0066FFFF", "&H00000000", "&H80000000", -1, 1, 4, 2, 5, 110, 2, "phrase"),
+        "gradient-stroke":   ("Arial", 66, "&H00FF66FF", "&H00FFCC00", "&H80000000", -1, 1, 4, 2, 5, 115, 3, "phrase"),
+        "comic-burst":       ("Impact", 70, "&H003355FF", "&H0000FFFF", "&H80000000", -1, 1, 4, 2, 5, 115, 2, "phrase"),
+        "minimal-clean":     ("Arial", 46, "&H00FFFFFF", "&H00000000", "&H64000000",  0, 1, 2, 1, 2, 180, 6, "phrase"),
+        "gaming-glitch":     ("Courier New", 64, "&H00FFFF00", "&H00FF00FF", "&H80000000", -1, 1, 3, 2, 5, 115, 2, "phrase"),
+    }
+    return table.get(style_name, table["bold-pop"])
+
+def build_styled_ass(segments, start_s, end_s, ass_path, caption_style, hook_style, hook_title):
+    if caption_style == "none" and hook_style == "none":
         return None
-    if style_mode == "bold_shorts":
-        font_sz, bold, align, margin_v, color = 62, -1, 5, 120, "&H0000FFFF"
-    else:
-        font_sz, bold, align, margin_v, color = 46, 0, 2, 170, "&H00FFFFFF"
+
+    chosen = caption_style
+    if chosen == "auto":
+        pool = [s for s in CAPTION_STYLES if s not in ("auto", "none", "minimal-clean")]
+        chosen = pool[int(start_s) % len(pool)]
+
+    font, sz, pri, out_c, back_c, bold, bstyle, out_w, shd, align, mv, step, mode = _style_params(chosen)
 
     header = (
         "[Script Info]\nScriptType: v4.00+\nPlayResX: 1080\nPlayResY: 1920\n\n"
         "[V4+ Styles]\nFormat: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, "
         "Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, "
         "Alignment, MarginL, MarginR, MarginV, Encoding\n"
-        f"Style: Default,Arial,{font_sz},{color},&H000000FF,&H00000000,&H80000000,{bold},0,0,0,100,100,0,0,1,3,1,{align},60,60,{margin_v},1\n\n"
+        f"Style: Default,{font},{sz},{pri},&H000000FF,{out_c},{back_c},{bold},0,0,0,100,100,0,0,{bstyle},{out_w},{shd},{align},60,60,{mv},1\n"
+        f"Style: HookBanner,Arial,44,&H00000000,&H000000FF,&H0000FFFF,&HFF00FFFF,-1,0,0,0,100,100,0,0,3,6,0,8,50,50,150,1\n\n"
         "[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n"
     )
-    lines = []
-    for s in segs:
-        rel_s = max(0.0, s["start"] - start_s)
-        rel_e = min(end_s - start_s, s["end"] - start_s)
-        if rel_e - rel_s < 0.25:
-            continue
-        words = re.sub(r"\s+", " ", s["text"].replace("{", "(").replace("}", ")")).strip().split()
-        step = 4 if style_mode == "bold_shorts" else 6
-        chunks = [" ".join(words[i:i + step]) for i in range(0, len(words), step)]
-        dur = (rel_e - rel_s) / max(1, len(chunks))
-        for idx_c, ch in enumerate(chunks):
-            cs = rel_s + idx_c * dur
-            ce = min(rel_e, cs + dur)
-            lines.append(f"Dialogue: 0,{_fmt_ass(cs)},{_fmt_ass(ce)},Default,,0,0,0,,{ch}")
-    if not lines:
+
+    events = []
+    if hook_style != "none" and hook_title:
+        banner_txt = _clean_text(hook_title).upper()[:42]
+        if banner_txt:
+            events.append(f"Dialogue: 2,0:00:00.20,0:00:03.60,HookBanner,,0,0,0,,{banner_txt}")
+
+    if chosen != "none" and segments:
+        clip_segs = [s for s in segments if s["end"] > start_s and s["start"] < end_s and s["text"].strip()]
+        for s in clip_segs:
+            rel_s = max(0.0, s["start"] - start_s)
+            rel_e = min(end_s - start_s, s["end"] - start_s)
+            if rel_e - rel_s < 0.2:
+                continue
+            words = _clean_text(s["text"]).split()
+            if not words:
+                continue
+            if mode == "word":
+                chunks = words
+            else:
+                chunks = [" ".join(words[i:i + step]) for i in range(0, len(words), step)]
+            dur = (rel_e - rel_s) / max(1, len(chunks))
+            for idx_c, ch in enumerate(chunks):
+                cs = rel_s + idx_c * dur
+                ce = min(rel_e, cs + dur)
+                label = f"{ch} 🔥" if (mode == "emoji" and idx_c % 2 == 0) else ch
+                events.append(f"Dialogue: 1,{_fmt_ass(cs)},{_fmt_ass(ce)},Default,,0,0,0,,{label}")
+
+    if not events:
         return None
     with open(ass_path, "w", encoding="utf-8") as f:
-        f.write(header + "\n".join(lines) + "\n")
+        f.write(header + "\n".join(events) + "\n")
     return ass_path
 
-def detect_fast_encoder():
+def detect_high_clarity_encoder():
     res = subprocess.run(["ffmpeg", "-encoders"], capture_output=True, text=True)
-    enc_out = res.stdout
-    if "h264_nvenc" in enc_out and subprocess.run(["nvidia-smi"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0:
-        return ("h264_nvenc", ["-preset", "p2", "-cq", "24"])
-    if "h264_qsv" in enc_out:
-        return ("h264_qsv", ["-preset", "veryfast", "-b:v", "4.5M"])
-    return ("libx264", ["-preset", "veryfast", "-crf", "24"])
+    enc = res.stdout
+    has_nv = subprocess.run(["nvidia-smi"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0
+    if "h264_nvenc" in enc and has_nv:
+        return ("h264_nvenc", ["-preset", "p3", "-b:v", "8M", "-maxrate", "12M", "-bufsize", "16M"])
+    if "h264_qsv" in enc:
+        return ("h264_qsv", ["-preset", "fast", "-b:v", "8M", "-maxrate", "12M"])
+    return ("libx264", ["-preset", "fast", "-crf", "20"])
 
-def fast_render_clip(src_mp4, idx, start_s, end_s, tmp_dir, final_dir, encoder_cfg, segments=None, subtitles="none", split_cam=False):
+def render_1080p_short(src_mp4, idx, start_s, end_s, tmp_dir, final_dir, enc_cfg, segments=None, caption_style="auto", hook_style="bold-box", hook_title="", split_cam=False):
     os.makedirs(final_dir, exist_ok=True)
     out_mp4 = os.path.join(final_dir, f"short_{idx:03d}.mp4")
     if os.path.exists(out_mp4) and os.path.getsize(out_mp4) > 0:
@@ -296,47 +352,44 @@ def fast_render_clip(src_mp4, idx, start_s, end_s, tmp_dir, final_dir, encoder_c
     if split_cam:
         vf = (
             "split[cam][game];"
-            "[cam]crop=iw*0.28:ih*0.28:0:0,scale=1080:670:force_original_aspect_ratio=increase,crop=1080:670[top];"
-            "[game]scale=1080:1250:force_original_aspect_ratio=increase,crop=1080:1250[bot];"
+            "[cam]crop=iw*0.28:ih*0.28:0:0,scale=1080:670:force_original_aspect_ratio=increase,crop=1080:670:flags=lanczos[top];"
+            "[game]scale=1080:1250:force_original_aspect_ratio=increase,crop=1080:1250:flags=lanczos[bot];"
             "[top][bot]vstack"
         )
     else:
-        # Fast vertical framing: scaled foreground centered over dark/dimmed backdrop
         vf = (
             "split[orig][bg];"
             "[bg]scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,eq=brightness=-0.25[bgd];"
-            "[orig]scale=1080:-2[fg];"
+            "[orig]scale=1080:-2:flags=lanczos[fg];"
             "[bgd][fg]overlay=(W-w)/2:(H-h)/2"
         )
 
-    if subtitles != "none":
-        ass_file = os.path.join(tmp_dir, f"sub_{idx:03d}.ass")
-        built = build_ass(segments, start_s, end_s, ass_file, subtitles)
-        if built:
-            esc = os.path.abspath(built).replace("\\", "/").replace(":", "\\:")
-            vf = f"{vf},ass='{esc}'"
+    ass_file = os.path.join(tmp_dir, f"sub_{idx:03d}.ass")
+    built = build_styled_ass(segments, start_s, end_s, ass_file, caption_style, hook_style, hook_title)
+    if built:
+        esc = os.path.abspath(built).replace("\\", "/").replace(":", "\\:")
+        vf = f"{vf},ass='{esc}'"
 
-    enc_name, enc_args = encoder_cfg
-    # Fast input seeking (-ss before -i) so FFmpeg jumps straight to start_s
+    enc_name, enc_args = enc_cfg
     cmd = [
         "ffmpeg", "-y",
         "-ss", f"{start_s:.2f}", "-t", f"{dur:.2f}", "-i", src_mp4,
         "-vf", vf,
         "-c:v", enc_name, *enc_args,
-        "-c:a", "aac", "-b:a", "128k",
+        "-c:a", "aac", "-b:a", "192k",
         out_mp4
     ]
     r = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     if r.returncode != 0 and enc_name != "libx264":
-        fallback_cmd = [
+        fb_cmd = [
             "ffmpeg", "-y",
             "-ss", f"{start_s:.2f}", "-t", f"{dur:.2f}", "-i", src_mp4,
             "-vf", vf,
-            "-c:v", "libx264", "-preset", "veryfast", "-crf", "24",
-            "-c:a", "aac", "-b:a", "128k",
+            "-c:v", "libx264", "-preset", "fast", "-crf", "20",
+            "-c:a", "aac", "-b:a", "192k",
             out_mp4
         ]
-        subprocess.run(fallback_cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        subprocess.run(fb_cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
     return out_mp4 if (os.path.exists(out_mp4) and os.path.getsize(out_mp4) > 0) else None
 
@@ -359,7 +412,7 @@ def write_reports(session_dir, title, url, rows):
         for r in rows
     )
     html = (
-        f"<!doctype html><html><head><meta charset='utf-8'><title>StreamClipper - {title}</title>"
+        f"<!doctype html><html><head><meta charset='utf-8'><title>StreamClipper 1080p - {title}</title>"
         f"<style>body{{font-family:sans-serif;background:#0f1115;color:#eee;padding:24px}}table{{width:100%;border-collapse:collapse}}th,td{{border:1px solid #2b303c;padding:8px;text-align:left}}th{{background:#1b202b}}</style></head>"
         f"<body><h1>{title}</h1><p>Source: {url}</p><table><thead><tr><th>#</th><th>Range</th><th>Duration</th><th>Hook/Title</th><th>Payoff Reason</th><th>File</th></tr></thead><tbody>{trs}</tbody></table></body></html>"
     )
@@ -368,28 +421,30 @@ def write_reports(session_dir, title, url, rows):
 
 def main():
     t0 = time.time()
-    parser = argparse.ArgumentParser(description="Fast OpusClip-Style Hook + Payoff Shorts Clipper (Max 50s)")
+    parser = argparse.ArgumentParser(description="1080p+ Hook & Payoff Shorts Generator with Full Caption/Hook Styles")
     parser.add_argument("url")
     parser.add_argument("--clips", type=int, default=30)
     parser.add_argument("--min-len", type=int, default=25)
     parser.add_argument("--max-len", type=int, default=50)
+    parser.add_argument("--min-height", type=int, default=1080)
     parser.add_argument("--out", default="StreamClipper")
     parser.add_argument("--work-dir", default="/tmp/streamclipper_fast" if os.name != "nt" else r"D:\hype-clipper\.fast_work")
-    parser.add_argument("--max-height", type=int, default=1080)
     parser.add_argument("--cookies", default=None)
     parser.add_argument("--split-cam", action="store_true")
-    parser.add_argument("--subtitles", choices=["none", "clean", "bold_shorts"], default="bold_shorts")
+    parser.add_argument("--caption-style", choices=CAPTION_STYLES, default="auto")
+    parser.add_argument("--hook-style", choices=HOOK_STYLES, default="bold-box")
     parser.add_argument("--ai-provider", choices=["auto", "groq", "gemini", "ollama", "heuristic"], default="auto")
     parser.add_argument("--ollama-model", default="qwen3.5:9b")
     args = parser.parse_args()
 
     max_len = min(args.max_len, 50)
     min_len = min(args.min_len, max_len)
+    min_height = max(1080, args.min_height)
 
     meta = get_metadata(args.url, args.cookies)
     title = meta.get("title") or "Stream"
     duration = float(meta.get("duration") or 3600)
-    sid = hashlib.md5(f"{args.url}|{min_len}|{max_len}|{args.subtitles}".encode()).hexdigest()[:10]
+    sid = hashlib.md5(f"{args.url}|{min_len}|{max_len}|{min_height}|{args.caption_style}|{args.hook_style}".encode()).hexdigest()[:10]
 
     local_work = os.path.join(args.work_dir, sid)
     local_shorts = os.path.join(local_work, "shorts")
@@ -400,7 +455,7 @@ def main():
     final_shorts_dir = os.path.join(final_session_dir, "shorts")
     os.makedirs(final_shorts_dir, exist_ok=True)
 
-    src_mp4 = download_source_once(args.url, os.path.join(local_work, "source.mp4"), args.cookies, args.max_height)
+    src_mp4 = download_source_1080p(args.url, os.path.join(local_work, "source_1080p.mp4"), args.cookies, min_height)
     wav_path = extract_audio_wav(src_mp4, os.path.join(local_work, "audio.wav"))
     segments = transcribe_segments(wav_path, os.path.join(local_work, "transcript.json")) if wav_path else []
     audio_scores = score_audio_peaks(wav_path)
@@ -409,15 +464,16 @@ def main():
         segments, audio_scores, duration, args.clips, min_len, max_len, args.ai_provider, args.ollama_model
     )
 
-    enc_cfg = detect_fast_encoder()
-    print(f"[4/4] Fast-rendering {len(selected)} clips ({min_len}s-{max_len}s) using {enc_cfg[0]}...")
+    enc_cfg = detect_high_clarity_encoder()
+    print(f"[4/4] Rendering {len(selected)} 1080x1920 Shorts ({min_len}s-{max_len}s) | Caption: {args.caption_style} | Hook: {args.hook_style} | Encoder: {enc_cfg[0]}")
 
     rows = []
     for i, c in enumerate(selected, 1):
         c_start = time.time()
-        out_local = fast_render_clip(
-            src_mp4, i, c["start"], c["end"], local_work, local_shorts,
-            enc_cfg, segments=segments, subtitles=args.subtitles, split_cam=args.split_cam
+        out_local = render_1080p_short(
+            src_mp4, i, c["start"], c["end"], local_work, local_shorts, enc_cfg,
+            segments=segments, caption_style=args.caption_style, hook_style=args.hook_style,
+            hook_title=c["title"], split_cam=args.split_cam
         )
         fname = f"short_{i:03d}.mp4"
         dest_file = os.path.join(final_shorts_dir, fname)
