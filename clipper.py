@@ -11,9 +11,9 @@ CAPTION_STYLES = [
     "typewriter", "bounce", "gradient-stroke",
     "comic-burst", "minimal-clean", "gaming-glitch", "none"
 ]
-HOOK_STYLES = ["bold-box", "outline-glow", "top-bar", "none"]
-LAYOUTS = ["blur-bg", "crop-focus", "cam-top", "cam-bottom"]
-CAM_POSITIONS = ["top-left", "top-right", "bottom-left", "bottom-right"]
+HOOK_STYLES = ["bold-box", "outline-glow", "top-bar", "mid-card", "none"]
+LAYOUTS = ["cam-top", "cam-bottom", "crop-focus", "blur-bg"]
+CAM_POSITIONS = ["mid-left", "mid-right", "top-left", "top-right", "bottom-left", "bottom-right", "custom"]
 
 GROQ_FREE_MODELS = ["openai/gpt-oss-120b", "openai/gpt-oss-20b", "qwen/qwen3.8-27b"]
 GEMINI_FREE_MODELS = ["gemini-3.8-flash", "gemini-3.6-flash", "gemini-3.5-flash-lite", "gemini-2.5-flash"]
@@ -21,8 +21,26 @@ GEMINI_FREE_MODELS = ["gemini-3.8-flash", "gemini-3.6-flash", "gemini-3.5-flash-
 def py_cmd():
     return "py" if os.name == "nt" else "python3"
 
+def find_font_file():
+    candidates = [
+        r"C:\Windows\Fonts\arialbd.ttf",
+        r"C:\Windows\Fonts\impact.ttf",
+        r"C:\Windows\Fonts\arial.ttf",
+        r"C:\Windows\Fonts\calibrib.ttf",
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+    ]
+    for p in candidates:
+        if os.path.exists(p):
+            return p
+    return None
+
+def escape_drawtext(txt):
+    s = re.sub(r"\s+", " ", (txt or "").replace("{", "(").replace("}", ")")).strip()
+    s = s.replace("\\", "").replace(":", "\\:").replace("'", "\u2019").replace("%", "\\%")
+    return s[:70]
+
 def probe_video_info(video_path):
-    """Returns (duration_sec, has_audio) using a single ffprobe call."""
     res = subprocess.run(
         ["ffprobe", "-v", "error", "-show_entries", "format=duration:stream=codec_type", "-of", "json", video_path],
         capture_output=True, text=True
@@ -38,6 +56,22 @@ def probe_video_info(video_path):
         except Exception:
             pass
     return dur, has_audio
+
+def detect_content_crop(video_path):
+    cmd = [
+        "ffmpeg", "-hide_banner", "-ss", "15", "-t", "6",
+        "-i", os.path.abspath(video_path),
+        "-vf", "cropdetect=24:16:0", "-f", "null", "-"
+    ]
+    res = subprocess.run(cmd, capture_output=True, text=True)
+    crops = re.findall(r"crop=(\d+:\d+:\d+:\d+)", res.stderr or "")
+    if not crops:
+        return None
+    most_common = max(set(crops), key=crops.count)
+    w, h, x, y = [int(v) for v in most_common.split(":")]
+    if w >= 200 and h >= 200:
+        return f"crop={w}:{h}:{x}:{y}"
+    return None
 
 def get_metadata(url, cookies=None):
     if os.path.isfile(url):
@@ -88,7 +122,6 @@ def extract_audio_wav(video_path, wav_path):
     return wav_path if os.path.exists(wav_path) else None
 
 def generate_hook_sfx(sfx_path):
-    """Synthesizes a stereo 44.1kHz copyright-free whoosh + sub-pop intro WAV."""
     if os.path.exists(sfx_path) and os.path.getsize(sfx_path) > 1024:
         return os.path.abspath(sfx_path)
     sr = 44100
@@ -127,7 +160,7 @@ def transcribe_segments(wav_path, cache_json):
     try:
         from faster_whisper import WhisperModel
     except Exception as e:
-        print(f"  -> WARNING: faster-whisper not installed ({e}). Subtitles disabled.")
+        print(f"  -> WARNING: faster-whisper not installed ({e}). Falling back to hook captions.")
         return []
 
     has_gpu = subprocess.run(["nvidia-smi"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0
@@ -150,13 +183,11 @@ def transcribe_segments(wav_path, cache_json):
             with open(cache_json, "w", encoding="utf-8") as f:
                 json.dump(out, f)
             print(f"  -> Transcribed {len(out)} segments on {device.upper()} ({model_name}).")
-            if not out:
-                print("  -> WARNING: 0 speech segments detected; only hook banners will show.")
             return out
         except Exception as e:
             print(f"  -> Whisper ({device}/{model_name}) failed: {e}")
             if device == "cuda":
-                print("  -> Retrying Whisper on CPU so subtitles still work...")
+                print("  -> Retrying Whisper on CPU...")
     return []
 
 def score_audio_peaks_fast(wav_path, bucket_sec=10):
@@ -375,172 +406,114 @@ def select_clips_full_stream(segments, audio_scores, duration, num_clips, min_le
     picked.sort(key=lambda x: x["start"])
     return picked
 
-def _fmt_ass(sec):
-    sec = max(0.0, float(sec))
-    h = int(sec // 3600)
-    m = int((sec % 3600) // 60)
-    s = sec % 60
-    return f"{h}:{m:02d}:{s:05.2f}"
-
-def _clean_text(txt):
-    return re.sub(r"\s+", " ", txt.replace("{", "(").replace("}", ")").replace("\\", "")).strip()
-
-def _default_font(prefer_heavy=False):
-    if os.name == "nt":
-        return "Impact" if prefer_heavy else "Arial"
-    return "DejaVu Sans"
-
-def _style_params(style_name):
-    # ASS colors are &HAABBGGRR where AA=00 is opaque, AA=FF is transparent
-    f_std = _default_font(False)
-    f_hvy = _default_font(True)
-    f_mon = "Courier New" if os.name == "nt" else "DejaVu Sans Mono"
-    # (font, size, pri, out, back, bold, bstyle, out_w, shd, align, mv, step, mode, accent_bgr)
-    table = {
-        "bold-pop":          (f_std, 70, "&H00FFFFFF", "&H00000000", "&H80000000", -1, 1, 5, 2, 5, 110, 3, "active", "00FFFF"),
-        "beast-bold":        (f_hvy, 78, "&H00FFFFFF", "&H00000000", "&H80000000", -1, 1, 6, 3, 5, 95,  2, "active", "44FF44"),
-        "karaoke-highlight": (f_std, 66, "&H00FFFFFF", "&H00000000", "&H80000000", -1, 1, 4, 2, 5, 120, 4, "active", "00FFFF"),
-        "word-by-word":      (f_hvy, 86, "&H00FFFFFF", "&H00000000", "&H80000000", -1, 1, 6, 2, 5, 100, 1, "word",   "00FFFF"),
-        "two-line-stack":    (f_std, 60, "&H00FFFFFF", "&H00000000", "&H80000000", -1, 1, 4, 2, 5, 120, 6, "active", "00FFFF"),
-        "highlight-box":     (f_std, 62, "&H00000000", "&H0000FFFF", "&H00000000", -1, 3, 8, 0, 5, 120, 3, "phrase", "00FFFF"),
-        "neon-glow":         (f_std, 68, "&H00FFFFFF", "&H00FFFF00", "&H80000000", -1, 1, 5, 3, 5, 120, 3, "active", "FFFF00"),
-        "impact-shake":      (f_hvy, 76, "&H0000FFFF", "&H00000000", "&H80000000", -1, 1, 5, 2, 5, 100, 2, "phrase", "00FFFF"),
-        "emoji-pop":         (f_std, 66, "&H00FFFFFF", "&H00000000", "&H80000000", -1, 1, 4, 2, 5, 120, 3, "active", "00FFFF"),
-        "typewriter":        (f_mon, 58, "&H00FFFFFF", "&H00000000", "&H80000000", -1, 1, 3, 1, 5, 130, 1, "word",   "00FFFF"),
-        "bounce":            (f_std, 70, "&H0000FFFF", "&H00000000", "&H80000000", -1, 1, 5, 2, 5, 110, 2, "phrase", "00FFFF"),
-        "gradient-stroke":   (f_std, 70, "&H0000FFFF", "&H00FF33CC", "&H80000000", -1, 1, 6, 2, 5, 115, 2, "phrase", "00FFFF"),
-        "comic-burst":       (f_hvy, 74, "&H004444FF", "&H00000000", "&H80000000", -1, 1, 5, 2, 5, 115, 2, "phrase", "4444FF"),
-        "minimal-clean":     (f_std, 50, "&H00FFFFFF", "&H00000000", "&H80000000",  0, 1, 3, 1, 2, 180, 5, "active", "00FFFF"),
-        "gaming-glitch":     (f_mon, 68, "&H00FFFF00", "&H00FF00FF", "&H80000000", -1, 1, 4, 2, 5, 115, 2, "phrase", "FFFF00"),
-    }
-    return table.get(style_name, table["bold-pop"])
-
-def _extract_word_tokens(clip_segs, start_s, end_s):
-    tokens = []
-    for s in clip_segs:
-        if s.get("words"):
-            for w in s["words"]:
-                ws = max(0.0, w["start"] - start_s)
-                we = min(end_s - start_s, w["end"] - start_s)
-                wt = _clean_text(w["word"])
-                if wt and we > ws:
-                    tokens.append((ws, we, wt))
-        else:
-            rs = max(0.0, s["start"] - start_s)
-            re_ = min(end_s - start_s, s["end"] - start_s)
-            words = _clean_text(s["text"]).split()
-            if words and re_ > rs:
-                wd = (re_ - rs) / len(words)
-                for i, wt in enumerate(words):
-                    tokens.append((rs + i * wd, min(re_, rs + (i + 1) * wd), wt))
-    return tokens
-
-def build_styled_ass(clip_segs, start_s, end_s, ass_path, caption_style, hook_style, hook_title):
-    if caption_style == "none" and hook_style == "none":
-        return None
-    chosen = caption_style
-    if chosen == "auto":
-        pool = [s for s in CAPTION_STYLES if s not in ("auto", "none", "minimal-clean")]
-        chosen = pool[int(start_s) % len(pool)]
-
-    font, sz, pri, out_c, back_c, bold, bstyle, out_w, shd, align, mv, step, mode, accent = _style_params(chosen)
-    f_hook = _default_font(False)
-
-    if hook_style == "top-bar":
-        hook_line = f"Style: HookBanner,{f_hook},46,&H00FFFFFF,&H000000FF,&H002626E6,&H00000000,-1,0,0,0,100,100,0,0,3,14,0,8,40,40,120,1"
-    elif hook_style == "outline-glow":
-        hook_line = f"Style: HookBanner,{f_hook},54,&H00FFFFFF,&H000000FF,&H0000FFFF,&H80000000,-1,0,0,0,100,100,0,0,1,7,2,8,40,40,140,1"
+def _cam_crop_expr(cam_pos, cam_w, cam_h, cam_x, cam_y):
+    cw = max(0.08, min(0.95, float(cam_w)))
+    ch = max(0.08, min(0.95, float(cam_h)))
+    if cam_pos == "custom":
+        rx = max(0.0, min(1.0 - cw, float(cam_x)))
+        ry = max(0.0, min(1.0 - ch, float(cam_y)))
+    elif cam_pos == "mid-left":
+        rx, ry = 0.01, max(0.0, min(1.0 - ch, 0.36))
+    elif cam_pos == "mid-right":
+        rx, ry = max(0.0, min(1.0 - cw, 0.99 - cw)), max(0.0, min(1.0 - ch, 0.36))
+    elif cam_pos == "top-right":
+        rx, ry = max(0.0, min(1.0 - cw, 1.0 - cw)), 0.0
+    elif cam_pos == "bottom-left":
+        rx, ry = 0.0, max(0.0, min(1.0 - ch, 1.0 - ch))
+    elif cam_pos == "bottom-right":
+        rx, ry = max(0.0, min(1.0 - cw, 1.0 - cw)), max(0.0, min(1.0 - ch, 1.0 - ch))
     else:
-        hook_line = f"Style: HookBanner,{f_hook},46,&H00000000,&H000000FF,&H0000FFFF,&H00000000,-1,0,0,0,100,100,0,0,3,12,0,8,40,40,140,1"
+        rx, ry = 0.0, 0.0
+    return f"crop=iw*{cw:.3f}:ih*{ch:.3f}:iw*{rx:.3f}:ih*{ry:.3f}"
 
-    header = (
-        "[Script Info]\nScriptType: v4.00+\nPlayResX: 1080\nPlayResY: 1920\nWrapStyle: 2\n\n"
-        "[V4+ Styles]\nFormat: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, "
-        "Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, "
-        "Alignment, MarginL, MarginR, MarginV, Encoding\n"
-        f"Style: Default,{font},{sz},{pri},&H000000FF,{out_c},{back_c},{bold},0,0,0,100,100,0,0,{bstyle},{out_w},{shd},{align},60,60,{mv},1\n"
-        f"{hook_line}\n\n"
-        "[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n"
-    )
-    events = []
-    if hook_style != "none" and hook_title:
-        banner = _clean_text(hook_title).upper()[:42]
-        if banner:
-            events.append(f"Dialogue: 2,0:00:00.15,0:00:03.80,HookBanner,,0,0,0,,{banner}")
+def _build_base_filter(layout, cam_pos, cam_w, cam_h, cam_x, cam_y, content_crop=None):
+    src_chain = f"[0:v]{content_crop}[vsrc]" if content_crop else "[0:v]null[vsrc]"
+    cam_crop = _cam_crop_expr(cam_pos, cam_w, cam_h, cam_x, cam_y)
 
-    if chosen != "none" and clip_segs:
-        tokens = _extract_word_tokens(clip_segs, start_s, end_s)
-        for i in range(0, len(tokens), step):
-            group = tokens[i : i + step]
-            if not group:
-                continue
-            if mode == "active" and len(group) > 1:
-                for active_idx, (ws, we, _) in enumerate(group):
-                    if we - ws < 0.05:
-                        continue
-                    parts = []
-                    for j, (_, _, wt) in enumerate(group):
-                        word_up = wt.upper() if chosen != "minimal-clean" else wt
-                        if j == active_idx:
-                            parts.append(f"{{\\c&H{accent}&}}{word_up}{{\\c&HFFFFFF&}}")
-                        else:
-                            parts.append(word_up)
-                    line = " ".join(parts)
-                    if chosen == "two-line-stack" and len(parts) >= 4:
-                        mid = len(parts) // 2
-                        line = " ".join(parts[:mid]) + "\\N" + " ".join(parts[mid:])
-                    events.append(f"Dialogue: 1,{_fmt_ass(ws)},{_fmt_ass(we)},Default,,0,0,0,,{line}")
-            else:
-                gs, ge = group[0][0], group[-1][1]
-                if ge - gs < 0.08:
-                    continue
-                text_out = " ".join(w[2].upper() if chosen != "minimal-clean" else w[2] for w in group)
-                events.append(f"Dialogue: 1,{_fmt_ass(gs)},{_fmt_ass(ge)},Default,,0,0,0,,{text_out}")
-
-    if not events:
-        return None
-    with open(ass_path, "w", encoding="utf-8") as f:
-        f.write(header + "\n".join(events) + "\n")
-    return os.path.basename(ass_path)
-
-def _cam_crop_expr(cam_pos):
-    if cam_pos == "top-right":
-        return "crop=iw*0.28:ih*0.28:iw*0.72:0"
-    if cam_pos == "bottom-left":
-        return "crop=iw*0.28:ih*0.28:0:ih*0.72"
-    if cam_pos == "bottom-right":
-        return "crop=iw*0.28:ih*0.28:iw*0.72:ih*0.72"
-    return "crop=iw*0.28:ih*0.28:0:0"
-
-def _build_video_filter(layout, cam_pos, ass_filename=None):
-    cam_crop = _cam_crop_expr(cam_pos)
     if layout == "crop-focus":
-        base = "[0:v]scale=1080:1920:force_original_aspect_ratio=increase:flags=lanczos,crop=1080:1920[vbase]"
-    elif layout == "cam-top":
-        base = (
-            "[0:v]split[cam][game];"
-            f"[cam]{cam_crop},scale=1080:640:force_original_aspect_ratio=increase:flags=lanczos,crop=1080:640[top];"
-            "[game]scale=1080:1280:force_original_aspect_ratio=increase:flags=lanczos,crop=1080:1280[bot];"
+        return f"{src_chain};[vsrc]scale=1080:1920:force_original_aspect_ratio=increase:flags=lanczos,crop=1080:1920[vbase]"
+    if layout == "cam-top":
+        return (
+            f"{src_chain};[vsrc]split[cam][game];"
+            f"[cam]{cam_crop},scale=1080:680:force_original_aspect_ratio=increase:flags=lanczos,crop=1080:680[top];"
+            "[game]scale=1080:1240:force_original_aspect_ratio=increase:flags=lanczos,crop=1080:1240[bot];"
             "[top][bot]vstack[vbase]"
         )
-    elif layout == "cam-bottom":
-        base = (
-            "[0:v]split[game][cam];"
-            "[game]scale=1080:1280:force_original_aspect_ratio=increase:flags=lanczos,crop=1080:1280[top];"
-            f"[cam]{cam_crop},scale=1080:640:force_original_aspect_ratio=increase:flags=lanczos,crop=1080:640[bot];"
+    if layout == "cam-bottom":
+        return (
+            f"{src_chain};[vsrc]split[game][cam];"
+            "[game]scale=1080:1240:force_original_aspect_ratio=increase:flags=lanczos,crop=1080:1240[top];"
+            f"[cam]{cam_crop},scale=1080:680:force_original_aspect_ratio=increase:flags=lanczos,crop=1080:680[bot];"
             "[top][bot]vstack[vbase]"
         )
-    else:
-        base = (
-            "[0:v]split[orig][bg];"
-            "[bg]scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,boxblur=18:2,eq=brightness=-0.22[bgd];"
-            "[orig]scale=1080:1920:force_original_aspect_ratio=decrease:flags=lanczos[fg];"
-            "[bgd][fg]overlay=(W-w)/2:(H-h)/2[vbase]"
-        )
+    return (
+        f"{src_chain};[vsrc]split[orig][bg];"
+        "[bg]scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,boxblur=18:2,eq=brightness=-0.22[bgd];"
+        "[orig]scale=1080:1920:force_original_aspect_ratio=decrease:flags=lanczos[fg];"
+        "[bgd][fg]overlay=(W-w)/2:(H-h)/2[vbase]"
+    )
 
-    if ass_filename:
-        return f"{base};[vbase]ass={ass_filename}[vout]"
-    return f"{base};[vbase]null[vout]"
+def _build_drawtext_chain(clip_segs, start_s, end_s, caption_style, hook_style, hook_title):
+    """Builds reliable FFmpeg drawtext filters so captions & hook text render even without libass."""
+    fontfile = find_font_file()
+    font_opt = f":fontfile='{fontfile.replace(chr(92), '/').replace(':', chr(92)+':')}'" if fontfile else ""
+    filters = []
+
+    if hook_style != "none" and hook_title:
+        htxt = escape_drawtext(hook_title.upper())
+        if htxt:
+            y_expr = "680-th/2" if hook_style == "mid-card" else "110"
+            box_col = "white@0.92" if hook_style == "mid-card" else ("red@0.90" if hook_style == "top-bar" else "yellow@0.95")
+            txt_col = "black" if hook_style == "mid-card" else ("white" if hook_style == "top-bar" else "black")
+            filters.append(
+                f"drawtext=text='{htxt}'{font_opt}:fontsize=42:fontcolor={txt_col}:box=1:boxcolor={box_col}:boxborderw=14:"
+                f"x=(w-tw)/2:y={y_expr}:enable='between(t,0.15,3.80)'"
+            )
+
+    if caption_style != "none" and clip_segs:
+        # Build short timed caption phrases in the lower/center safe zone
+        step = 1 if caption_style in ("word-by-word", "typewriter") else (2 if caption_style in ("beast-bold", "impact-shake", "comic-burst", "bounce", "gaming-glitch") else 4)
+        for s in clip_segs:
+            words = s.get("words") or []
+            if words:
+                for i in range(0, len(words), step):
+                    grp = words[i : i + step]
+                    if not grp:
+                        continue
+                    rs = max(0.0, grp[0]["start"] - start_s)
+                    re_ = min(end_s - start_s, grp[-1]["end"] - start_s)
+                    if re_ - rs < 0.12:
+                        continue
+                    ctxt = escape_drawtext(" ".join(w["word"].upper() for w in grp))
+                    if ctxt:
+                        fsize = 76 if caption_style == "word-by-word" else (50 if caption_style == "minimal-clean" else 62)
+                        tcol = "yellow" if caption_style in ("bold-pop", "bounce", "impact-shake", "word-by-word") else ("cyan" if caption_style in ("neon-glow", "gaming-glitch") else "white")
+                        y_pos = "h-260" if caption_style == "minimal-clean" else "h*0.62"
+                        filters.append(
+                            f"drawtext=text='{ctxt}'{font_opt}:fontsize={fsize}:fontcolor={tcol}:borderw=4:bordercolor=black:"
+                            f"x=(w-tw)/2:y={y_pos}:enable='between(t,{rs:.2f},{re_:.2f})'"
+                        )
+            else:
+                rs = max(0.0, s["start"] - start_s)
+                re_ = min(end_s - start_s, s["end"] - start_s)
+                if re_ - rs < 0.15:
+                    continue
+                words_list = re.sub(r"\s+", " ", s["text"]).strip().split()
+                for i in range(0, len(words_list), step):
+                    grp = words_list[i : i + step]
+                    if not grp:
+                        continue
+                    dur_w = (re_ - rs) / max(1, (len(words_list) + step - 1) // step)
+                    cs = rs + (i // step) * dur_w
+                    ce = min(re_, cs + dur_w)
+                    ctxt = escape_drawtext(" ".join(w.upper() for w in grp))
+                    if ctxt:
+                        filters.append(
+                            f"drawtext=text='{ctxt}'{font_opt}:fontsize=62:fontcolor=yellow:borderw=4:bordercolor=black:"
+                            f"x=(w-tw)/2:y=h*0.62:enable='between(t,{cs:.2f},{ce:.2f})'"
+                        )
+
+    return ",".join(filters) if filters else None
 
 def detect_fast_1080p_encoder():
     res = subprocess.run(["ffmpeg", "-encoders"], capture_output=True, text=True)
@@ -554,9 +527,9 @@ def detect_fast_1080p_encoder():
 
 def _render_worker(args_tuple):
     (
-        src_mp4, idx, clip, tmp_dir, local_shorts, final_shorts,
+        src_mp4, idx, clip, local_shorts, final_shorts,
         enc_name, enc_args, clip_segs, caption_style, hook_style,
-        layout, cam_pos, sfx_path, has_audio
+        layout, cam_pos, cam_w, cam_h, cam_x, cam_y, content_crop, sfx_path, has_audio
     ) = args_tuple
     t0 = time.time()
     fname = f"short_{idx:03d}.mp4"
@@ -568,9 +541,9 @@ def _render_worker(args_tuple):
     start_s, end_s = clip["start"], clip["end"]
     dur = max(1.0, float(end_s) - float(start_s))
 
-    ass_path = os.path.join(tmp_dir, f"sub_{idx:03d}.ass")
-    ass_filename = build_styled_ass(clip_segs, start_s, end_s, ass_path, caption_style, hook_style, clip["title"])
-    vfilter = _build_video_filter(layout, cam_pos, ass_filename)
+    base_f = _build_base_filter(layout, cam_pos, cam_w, cam_h, cam_x, cam_y, content_crop)
+    dt_chain = _build_drawtext_chain(clip_segs, start_s, end_s, caption_style, hook_style, clip["title"])
+    vfilter = f"{base_f};[vbase]{dt_chain}[vout]" if dt_chain else f"{base_f};[vbase]null[vout]"
 
     inputs = ["-ss", f"{start_s:.2f}", "-t", f"{dur:.2f}", "-i", os.path.abspath(src_mp4)]
     if has_audio and sfx_path and os.path.exists(sfx_path):
@@ -586,11 +559,11 @@ def _render_worker(args_tuple):
         fc = vfilter
         maps = ["-map", "[vout]", "-map", "0:a?"]
 
-    def _run_enc(e_name, e_args):
+    def _run_enc(e_name, e_args, filter_str):
         cmd = [
             "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
             *inputs,
-            "-filter_complex", fc,
+            "-filter_complex", filter_str,
             *maps,
             "-pix_fmt", "yuv420p",
             "-c:v", e_name, *e_args,
@@ -598,12 +571,16 @@ def _render_worker(args_tuple):
             "-movflags", "+faststart",
             out_local
         ]
-        # cwd=tmp_dir ensures ass=sub_001.ass needs ZERO path escaping on Windows or Linux
-        return subprocess.run(cmd, cwd=tmp_dir, capture_output=True, text=True)
+        return subprocess.run(cmd, capture_output=True, text=True)
 
-    r = _run_enc(enc_name, enc_args)
+    r = _run_enc(enc_name, enc_args, fc)
+    if r.returncode != 0 and dt_chain:
+        # Retry without fontfile in case fontconfig/freetype dislikes fontfile path
+        no_font_dt = re.sub(r":fontfile='[^']*'", "", dt_chain)
+        fc2 = fc.replace(dt_chain, no_font_dt)
+        r = _run_enc(enc_name, enc_args, fc2)
     if r.returncode != 0 and enc_name != "libx264":
-        r = _run_enc("libx264", ["-preset", "ultrafast", "-crf", "21"])
+        r = _run_enc("libx264", ["-preset", "ultrafast", "-crf", "21"], fc)
 
     if os.path.exists(out_local) and os.path.getsize(out_local) > 10240:
         shutil.copy2(out_local, final_path)
@@ -660,7 +637,7 @@ def write_reports(session_dir, title, url, rows, top_meta):
         for r in rows
     )
     html = (
-        f"<!doctype html><html><head><meta charset='utf-8'><title>HypeClipper v4 - {title}</title>"
+        f"<!doctype html><html><head><meta charset='utf-8'><title>HypeClipper v5 - {title}</title>"
         f"<style>body{{font-family:sans-serif;background:#0f1115;color:#eee;padding:24px}}.grid{{display:grid;grid-template-columns:repeat(auto-fill,minmax(180px,1fr));gap:14px;margin-bottom:28px}}.card{{background:#171b24;border:1px solid #2b303c;border-radius:8px;overflow:hidden;padding:8px}}.card img{{width:100%;border-radius:6px;margin-bottom:6px}}table{{width:100%;border-collapse:collapse}}th,td{{border:1px solid #2b303c;padding:8px;text-align:left}}th{{background:#1b202b}}</style></head>"
         f"<body><h1>HypeClipper Report: {title}</h1><p>Source: {url}</p><h2>Top 10 Viral Picks</h2><div class='grid'>{cards}</div><h2>All Clips</h2><table><thead><tr><th>#</th><th>Score</th><th>Range</th><th>Duration</th><th>Hook/Title</th><th>Payoff Reason</th><th>File</th></tr></thead><tbody>{trs}</tbody></table></body></html>"
     )
@@ -669,7 +646,7 @@ def write_reports(session_dir, title, url, rows, top_meta):
 
 def main():
     t0 = time.time()
-    parser = argparse.ArgumentParser(description="HypeClipper v4: Audited 1080p+ Hook & Payoff Shorts Engine")
+    parser = argparse.ArgumentParser(description="HypeClipper v5: Drawtext + Subtitle Burn-in, Top 10 Viral, SFX, Custom Cam Crop")
     parser.add_argument("url")
     parser.add_argument("--clips", type=int, default=40)
     parser.add_argument("--min-len", type=int, default=25)
@@ -679,11 +656,16 @@ def main():
     parser.add_argument("--out", default="HypeClipper")
     parser.add_argument("--work-dir", default="/tmp/hypeclipper_fast" if os.name != "nt" else r"D:\hype-clipper\.fast_work")
     parser.add_argument("--cookies", default=None)
-    parser.add_argument("--layout", choices=LAYOUTS, default="blur-bg")
-    parser.add_argument("--cam-pos", choices=CAM_POSITIONS, default="top-left")
+    parser.add_argument("--layout", choices=LAYOUTS, default="cam-top")
+    parser.add_argument("--cam-pos", choices=CAM_POSITIONS, default="mid-left")
+    parser.add_argument("--cam-w", type=float, default=0.26)
+    parser.add_argument("--cam-h", type=float, default=0.34)
+    parser.add_argument("--cam-x", type=float, default=0.01)
+    parser.add_argument("--cam-y", type=float, default=0.36)
+    parser.add_argument("--no-autocrop", action="store_true")
     parser.add_argument("--sfx", action="store_true")
-    parser.add_argument("--caption-style", choices=CAPTION_STYLES, default="auto")
-    parser.add_argument("--hook-style", choices=HOOK_STYLES, default="bold-box")
+    parser.add_argument("--caption-style", choices=CAPTION_STYLES, default="beast-bold")
+    parser.add_argument("--hook-style", choices=HOOK_STYLES, default="mid-card")
     parser.add_argument("--ai-provider", choices=["auto", "groq", "gemini", "ollama", "heuristic"], default="auto")
     parser.add_argument("--ollama-model", default="qwen3.5:9b")
     args = parser.parse_args()
@@ -694,7 +676,7 @@ def main():
 
     meta = get_metadata(args.url, args.cookies)
     title = meta.get("title") or "Stream"
-    sid = hashlib.md5(f"{args.url}|{min_len}|{max_len}|{min_height}|{args.layout}|{args.cam_pos}|{args.caption_style}|{args.hook_style}|{args.sfx}".encode()).hexdigest()[:10]
+    sid = hashlib.md5(f"{args.url}|{min_len}|{max_len}|{min_height}|{args.layout}|{args.cam_pos}|{args.cam_w}|{args.cam_h}|{args.cam_x}|{args.cam_y}|{args.caption_style}|{args.hook_style}|{args.sfx}".encode()).hexdigest()[:10]
 
     local_work = os.path.abspath(os.path.join(args.work_dir, sid))
     local_shorts = os.path.join(local_work, "shorts")
@@ -707,6 +689,10 @@ def main():
 
     src_mp4 = download_source_1080p(args.url, os.path.join(local_work, "source_1080p.mp4"), args.cookies, min_height)
     duration, has_audio = probe_video_info(src_mp4)
+    content_crop = None if args.no_autocrop else detect_content_crop(src_mp4)
+    if content_crop:
+        print(f"  -> Detected borders; trimming source with {content_crop}")
+
     wav_path = extract_audio_wav(src_mp4, os.path.join(local_work, "audio.wav")) if has_audio else None
     sfx_path = generate_hook_sfx(os.path.join(local_work, "hook_sfx.wav")) if (args.sfx and has_audio) else None
     segments = transcribe_segments(wav_path, os.path.join(local_work, "transcript.json")) if wav_path else []
@@ -718,16 +704,16 @@ def main():
 
     enc_name, enc_args = detect_fast_1080p_encoder()
     workers = 2 if enc_name == "h264_nvenc" else max(1, min(args.workers, os.cpu_count() or 4))
-    print(f"[4/5] Rendering {len(selected)} 1080p Shorts ({workers} workers, {enc_name}, layout={args.layout}, sfx={args.sfx})...")
+    print(f"[4/5] Rendering {len(selected)} 1080p Shorts ({workers} workers, {enc_name}, layout={args.layout}, cam={args.cam_pos})...")
 
     tasks = []
     for i, c in enumerate(selected, 1):
-        # Slice only relevant segments per clip to avoid pickling full transcript
         c_segs = [s for s in segments if s["end"] > c["start"] and s["start"] < c["end"]]
         tasks.append((
-            src_mp4, i, c, local_work, local_shorts, final_shorts_dir,
+            src_mp4, i, c, local_shorts, final_shorts_dir,
             enc_name, enc_args, c_segs, args.caption_style, args.hook_style,
-            args.layout, args.cam_pos, sfx_path, has_audio
+            args.layout, args.cam_pos, args.cam_w, args.cam_h, args.cam_x, args.cam_y,
+            content_crop, sfx_path, has_audio
         ))
 
     results_map = {}
