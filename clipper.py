@@ -1,7 +1,5 @@
-﻿import argparse, csv, hashlib, json, os, re, subprocess, sys
+﻿import argparse, csv, hashlib, json, os, re, shutil, subprocess, time
 from collections import defaultdict
-import cv2
-import numpy as np
 import requests
 
 def py_cmd():
@@ -17,138 +15,87 @@ def get_metadata(url, cookies=None):
         raise RuntimeError(f"yt-dlp metadata failed:\n{res.stderr}")
     return json.loads(res.stdout)
 
-def download_audio(url, out_path, cookies=None):
-    if os.path.exists(out_path):
-        os.remove(out_path)
-    cmd = [py_cmd(), "-m", "yt_dlp", "-f", "bestaudio[ext=m4a]/bestaudio", "-o", out_path]
+def download_source_once(url, dest_mp4, cookies=None, max_height=1080):
+    if os.path.exists(dest_mp4) and os.path.getsize(dest_mp4) > 1024 * 1024:
+        print(f"[1/4] Using cached local source video: {dest_mp4}")
+        return dest_mp4
+    print(f"[1/4] Downloading source video once (up to {max_height}p) into fast local storage...")
+    fmt = f"bestvideo[height<={max_height}][ext=mp4]+bestaudio[ext=m4a]/best[height<={max_height}][ext=mp4]/best"
+    cmd = [py_cmd(), "-m", "yt_dlp", "-f", fmt, "--merge-output-format", "mp4", "-o", dest_mp4]
     if cookies and os.path.exists(cookies):
         cmd += ["--cookies", cookies]
     cmd.append(url)
-    subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    return out_path if os.path.exists(out_path) else None
+    res = subprocess.run(cmd, capture_output=True, text=True)
+    if res.returncode != 0 or not os.path.exists(dest_mp4):
+        raise RuntimeError(f"Failed to download video:\n{res.stderr}")
+    return dest_mp4
 
-def transcribe_segments(audio_path, cache_path):
-    if os.path.exists(cache_path):
+def extract_audio_wav(video_path, wav_path):
+    if os.path.exists(wav_path) and os.path.getsize(wav_path) > 0:
+        return wav_path
+    cmd = ["ffmpeg", "-y", "-i", video_path, "-vn", "-ac", "1", "-ar", "16000", "-c:a", "pcm_s16le", wav_path]
+    subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    return wav_path if os.path.exists(wav_path) else None
+
+def transcribe_segments(wav_path, cache_json):
+    if os.path.exists(cache_json):
         try:
-            with open(cache_path, "r", encoding="utf-8") as f:
-                cached = json.load(f)
-            if cached:
-                print(f"[1/4] Loaded {len(cached)} cached transcript segments.")
-                return cached
+            with open(cache_json, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if data:
+                print(f"[2/4] Loaded {len(data)} cached transcript segments.")
+                return data
         except Exception:
             pass
 
-    print("[1/4] Transcribing speech with faster-whisper...")
+    print("[2/4] Transcribing speech with faster-whisper...")
     try:
         from faster_whisper import WhisperModel
         has_gpu = subprocess.run(["nvidia-smi"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0
         device = "cuda" if has_gpu else "cpu"
         compute = "float16" if has_gpu else "int8"
-        model_size = "small" if has_gpu else "base"
-        model = WhisperModel(model_size, device=device, compute_type=compute)
-        segs, _ = model.transcribe(audio_path, beam_size=3, vad_filter=True)
-        out = []
-        for s in segs:
-            txt = s.text.strip()
-            if txt:
-                out.append({"start": float(s.start), "end": float(s.end), "text": txt})
-        with open(cache_path, "w", encoding="utf-8") as f:
+        model_name = "small" if has_gpu else "base"
+        model = WhisperModel(model_name, device=device, compute_type=compute)
+        segs, _ = model.transcribe(wav_path, beam_size=1, vad_filter=True)
+        out = [{"start": float(s.start), "end": float(s.end), "text": s.text.strip()} for s in segs if s.text.strip()]
+        with open(cache_json, "w", encoding="utf-8") as f:
             json.dump(out, f, indent=2)
-        print(f"  -> Transcribed {len(out)} segments on {device.upper()} ({model_size}).")
+        print(f"  -> Transcribed {len(out)} segments ({device.upper()}, {model_name}).")
         return out
     except Exception as e:
-        print(f"  -> Whisper skipped ({e}); falling back to audio/chat signals.")
+        print(f"  -> Whisper skipped ({e}); using heuristic windows.")
         return []
 
-def score_audio_variation(audio_path, bucket_sec=10):
-    print("[2/4] Scoring audio energy & sudden volume jumps...")
+def score_audio_peaks(wav_path, bucket_sec=10):
     deltas = defaultdict(float)
-    if not audio_path or not os.path.exists(audio_path):
+    if not wav_path or not os.path.exists(wav_path):
         return deltas
-    ff_cmd = [
-        "ffmpeg", "-i", audio_path,
+    cmd = [
+        "ffmpeg", "-i", wav_path,
         "-af", "astats=metadata=1:reset=100,ametadata=print:key=lavfi.astats.Overall.RMS_level",
         "-f", "null", "-"
     ]
-    res = subprocess.run(ff_cmd, capture_output=True, text=True)
+    res = subprocess.run(cmd, capture_output=True, text=True)
     times = re.findall(r"pts_time:([0-9.]+)", res.stderr)
     levels = re.findall(r"RMS_level=([-0-9.]+)", res.stderr)
-    bucket_rms = defaultdict(list)
+    buckets = defaultdict(list)
     for t, lvl in zip(times, levels):
         try:
-            val = float(lvl)
-            if val > -60.0:
-                bucket_rms[int(float(t) // bucket_sec)].append(val)
+            v = float(lvl)
+            if v > -60.0:
+                buckets[int(float(t) // bucket_sec)].append(v)
         except ValueError:
             pass
-    sorted_b = sorted(bucket_rms.keys())
-    for i, b in enumerate(sorted_b):
-        curr_max = max(bucket_rms[b])
-        prev_avg = sum(bucket_rms[sorted_b[i-1]]) / len(bucket_rms[sorted_b[i-1]]) if i > 0 else curr_max
-        jump = max(0.0, curr_max - prev_avg)
-        deltas[b] = (jump * 2.0) + max(0.0, curr_max + 30.0)
+    ordered = sorted(buckets.keys())
+    for i, b in enumerate(ordered):
+        mx = max(buckets[b])
+        prev = sum(buckets[ordered[i - 1]]) / len(buckets[ordered[i - 1]]) if i > 0 else mx
+        deltas[b] = max(0.0, mx - prev) * 2.0 + max(0.0, mx + 30.0)
     return deltas
 
-def score_chat_and_motion(url, duration, chat_side="right", cookies=None, bucket_sec=10):
-    print("[3/4] Checking live chat velocity & on-screen chat scroll motion...")
-    chat_file = "temp_chat.json"
-    if os.path.exists(chat_file):
-        os.remove(chat_file)
-    subprocess.run([py_cmd(), "-m", "chat_downloader", url, "--output", chat_file, "--quiet"],
-                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    chat_buckets = defaultdict(int)
-    if os.path.exists(chat_file):
-        try:
-            with open(chat_file, "r", encoding="utf-8") as f:
-                for msg in json.load(f):
-                    t = msg.get("time_in_seconds", -1)
-                    if 0 <= t <= duration:
-                        chat_buckets[int(t // bucket_sec)] += 1
-        except Exception:
-            pass
-        finally:
-            os.remove(chat_file)
-
-    motion_buckets = defaultdict(float)
-    if chat_side != "none":
-        get_cmd = [py_cmd(), "-m", "yt_dlp", "-f", "best[height<=360]/worst", "-g"]
-        if cookies and os.path.exists(cookies):
-            get_cmd += ["--cookies", cookies]
-        get_cmd.append(url)
-        r = subprocess.run(get_cmd, capture_output=True, text=True)
-        stream_url = r.stdout.strip().splitlines()[0] if r.returncode == 0 and r.stdout.strip() else None
-        if stream_url:
-            w, h = 640, 360
-            proc = subprocess.Popen(
-                ["ffmpeg", "-loglevel", "error", "-i", stream_url, "-vf", f"fps=2,scale={w}:{h},format=gray", "-f", "rawvideo", "-"],
-                stdout=subprocess.PIPE, bufsize=w*h*4
-            )
-            y1, y2 = int(h * 0.25), int(h * 0.90)
-            x1, x2 = (0, int(w * 0.26)) if chat_side == "left" else (int(w * 0.74), w)
-            prev_crop = None
-            idx = 0
-            b_vals = defaultdict(list)
-            while True:
-                raw = proc.stdout.read(w * h)
-                if len(raw) < w * h:
-                    break
-                crop = np.frombuffer(raw, dtype=np.uint8).reshape((h, w))[y1:y2, x1:x2]
-                if prev_crop is not None:
-                    diff = cv2.absdiff(crop, prev_crop)
-                    _, th = cv2.threshold(diff, 25, 255, cv2.THRESH_BINARY)
-                    b_vals[int((idx * 0.5) // bucket_sec)].append(float(np.mean(th)))
-                prev_crop = crop
-                idx += 1
-            proc.wait()
-            for b, vals in b_vals.items():
-                if vals:
-                    motion_buckets[b] = sum(vals) / len(vals)
-
-    return chat_buckets, motion_buckets
-
-def _snap_to_hook_and_payoff(segments, start_sec, end_sec, min_len, max_len, duration):
-    start = max(0.0, float(start_sec))
-    end = min(float(duration), float(end_sec))
+def snap_hook_payoff(segments, start_s, end_s, min_len, max_len, duration):
+    start = max(0.0, float(start_s))
+    end = min(float(duration), float(end_s))
     if end - start < min_len:
         end = min(float(duration), start + min_len)
     if end - start > max_len:
@@ -158,7 +105,6 @@ def _snap_to_hook_and_payoff(segments, start_sec, end_sec, min_len, max_len, dur
         return round(start, 2), round(min(float(duration), end), 2)
 
     hook_re = re.compile(r"\b(wait|what|why|how|no way|bro|crazy|insane|look|watch|secret|never|caught|mistake|truth)\b", re.I)
-
     for s in reversed(segments):
         if start - 8.0 <= s["start"] <= start + 2.0 and hook_re.search(s["text"]):
             start = max(0.0, s["start"] - 1.0)
@@ -182,232 +128,171 @@ def _snap_to_hook_and_payoff(segments, start_sec, end_sec, min_len, max_len, dur
 
     return round(start, 2), round(best_end, 2)
 
-def _parse_ai_clips(content, num_clips, min_len, max_len, duration, segments):
-    match = re.search(r"\[[\s\S]*\]", content)
-    if not match:
+def parse_ai_json(text, num_clips, min_len, max_len, duration, segments):
+    m = re.search(r"\[[\s\S]*\]", text or "")
+    if not m:
         return []
-    items = json.loads(match.group(0))
-    results = []
+    items = json.loads(m.group(0))
+    out = []
     for item in items:
-        st, en = _snap_to_hook_and_payoff(
-            segments, item.get("start", 0), item.get("end", 0), min_len, max_len, duration
-        )
+        st, en = snap_hook_payoff(segments, item.get("start", 0), item.get("end", 0), min_len, max_len, duration)
         if en - st >= min(min_len, 15):
-            results.append({
+            out.append({
                 "start": st,
                 "end": en,
                 "duration": round(en - st, 1),
                 "title": str(item.get("title", "Hook + Payoff Clip"))[:80],
-                "reason": str(item.get("reason", "Strong hook and complete payoff"))[:140],
+                "reason": str(item.get("reason", "Hook + complete payoff"))[:140],
             })
-    return results[:num_clips]
+    return out[:num_clips]
 
-def select_clips(segments, audio_scores, chat_scores, motion_scores, duration, num_clips, min_len, max_len, provider, ollama_model):
+def select_clips(segments, audio_scores, duration, num_clips, min_len, max_len, provider, ollama_model):
+    print("[3/4] Selecting hook-to-payoff segments (<= 50s)...")
     groq_key = os.environ.get("GROQ_API_KEY", "").strip()
     gemini_key = os.environ.get("GEMINI_API_KEY", "").strip()
 
-    prompt = None
     if segments:
-        transcript_lines = "\n".join(
-            f"[{int(s['start'])}s-{int(s['end'])}s] {s['text']}" for s in segments[:650]
-        )
+        lines = "\n".join(f"[{int(s['start'])}s-{int(s['end'])}s] {s['text']}" for s in segments[:600])
         prompt = (
-            f"You are an expert short-form video editor. Pick up to {num_clips} viral-worthy clips from this stream transcript.\n"
-            f"Strict rules:\n"
-            f"1. Every clip MUST open with a clear HOOK (curiosity, shock, bold statement, question, or intense moment) and stay through the PAYOFF/ENDING (punchline, result, or resolution—never cut mid-thought).\n"
-            f"2. Each clip duration MUST be between {min_len} and {max_len} seconds (NEVER exceed {max_len}s, and avoid short fragmented cuts).\n"
-            f"3. Return ONLY a valid JSON array: [{{\"start\": 120, \"end\": 164, \"title\": \"Short title\", \"reason\": \"Why hook + ending works\"}}].\n\n"
-            f"Transcript:\n{transcript_lines}"
+            f"Select up to {num_clips} engaging Short-form clips from this transcript.\n"
+            f"Rules:\n"
+            f"1. Start on a strong HOOK and end on a complete PAYOFF/PUNCHLINE/ENDING (never cut mid-thought).\n"
+            f"2. Duration MUST be between {min_len} and {max_len} seconds (strictly <= {max_len}s).\n"
+            f"3. Return ONLY a JSON list: [{{\"start\": 120, \"end\": 162, \"title\": \"Title\", \"reason\": \"Hook + payoff\"}}].\n\n"
+            f"Transcript:\n{lines}"
         )
 
-    order = []
-    if provider == "auto":
-        if groq_key:
-            order.append("groq")
-        if gemini_key:
-            order.append("gemini")
-        order.append("ollama")
-    elif provider != "heuristic":
-        order.append(provider)
+        order = []
+        if provider == "auto":
+            if groq_key:
+                order.append("groq")
+            if gemini_key:
+                order.append("gemini")
+            order.append("heuristic")
+        elif provider != "heuristic":
+            order.append(provider)
 
-    if prompt:
         for p in order:
             try:
-                if p == "groq":
-                    if not groq_key:
-                        continue
-                    print("  -> Selecting hook+payoff clips via Groq free API (llama-3.3-70b-versatile)...")
+                if p == "groq" and groq_key:
                     r = requests.post(
                         "https://api.groq.com/openai/v1/chat/completions",
                         headers={"Authorization": f"Bearer {groq_key}", "Content-Type": "application/json"},
-                        json={
-                            "model": "llama-3.3-70b-versatile",
-                            "messages": [{"role": "user", "content": prompt}],
-                            "temperature": 0.35,
-                        },
-                        timeout=60,
+                        json={"model": "llama-3.3-70b-versatile", "messages": [{"role": "user", "content": prompt}], "temperature": 0.35},
+                        timeout=45,
                     )
                     r.raise_for_status()
-                    txt = r.json()["choices"][0]["message"]["content"]
-                elif p == "gemini":
-                    if not gemini_key:
-                        continue
-                    print("  -> Selecting hook+payoff clips via Google AI Studio free API (gemini-3.8-flash)...")
+                    parsed = parse_ai_json(r.json()["choices"][0]["message"]["content"], num_clips, min_len, max_len, duration, segments)
+                    if parsed:
+                        return parsed
+                elif p == "gemini" and gemini_key:
                     r = requests.post(
-                        f"https://generativelanguage.googleapis.com/v1beta/models/gemini-3.8-flash:generateContent?key={gemini_key}",
+                        f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={gemini_key}",
                         json={"contents": [{"parts": [{"text": prompt}]}]},
-                        timeout=60,
+                        timeout=45,
                     )
                     r.raise_for_status()
-                    txt = r.json()["candidates"][0]["content"]["parts"][0]["text"]
+                    parsed = parse_ai_json(r.json()["candidates"][0]["content"]["parts"][0]["text"], num_clips, min_len, max_len, duration, segments)
+                    if parsed:
+                        return parsed
                 elif p == "ollama":
-                    print(f"  -> Selecting hook+payoff clips via Ollama ({ollama_model})...")
                     r = requests.post(
                         "http://127.0.0.1:11434/api/generate",
                         json={"model": ollama_model, "prompt": prompt, "stream": False, "options": {"temperature": 0.35}},
-                        timeout=240,
+                        timeout=120,
                     )
                     r.raise_for_status()
-                    txt = r.json().get("response", "")
-                else:
-                    continue
-
-                parsed = _parse_ai_clips(txt, num_clips, min_len, max_len, duration, segments)
-                if parsed:
-                    return parsed
+                    parsed = parse_ai_json(r.json().get("response", ""), num_clips, min_len, max_len, duration, segments)
+                    if parsed:
+                        return parsed
             except Exception as e:
-                print(f"  -> {p} skipped ({e})")
+                print(f"  -> {p} skipped ({e}); using fast hook+payoff scorer.")
 
-    candidates = []
+    # Fast local hook + payoff + audio scorer
+    hook_re = re.compile(r"\b(wait|what|why|how|no way|bro|crazy|insane|look|watch|secret|never|caught|mistake|truth)\b", re.I)
+    scored = []
     if segments:
-        hook_re = re.compile(r"\b(wait|what|why|how|no way|bro|crazy|insane|look|watch|secret|never|caught|mistake|truth)\b", re.I)
         for seg in segments:
-            b_idx = int(seg["start"] // 10)
-            signal_boost = (
-                (0.45 * min(100.0, chat_scores.get(b_idx, 0) * 5.0))
-                + (0.35 * min(100.0, motion_scores.get(b_idx, 0) * 4.0))
-                + (0.20 * min(100.0, audio_scores.get(b_idx, 0)))
-            )
-            hook_score = 35.0 if hook_re.search(seg["text"]) else 5.0
-            st, en = _snap_to_hook_and_payoff(segments, seg["start"] - 1.0, seg["start"] + max_len, min_len, max_len, duration)
-            candidates.append((hook_score + signal_boost, st, en, seg["text"][:60]))
+            b = int(seg["start"] // 10)
+            sc = (30.0 if hook_re.search(seg["text"]) else 5.0) + min(50.0, audio_scores.get(b, 0.0))
+            st, en = snap_hook_payoff(segments, seg["start"] - 1.0, seg["start"] + max_len, min_len, max_len, duration)
+            scored.append((sc, st, en, seg["text"][:60]))
     else:
-        combined = defaultdict(float)
-        for b, v in audio_scores.items():
-            combined[b] += v * 0.45
-        for b, v in motion_scores.items():
-            combined[b] += v * 0.35
-        for b, v in chat_scores.items():
-            combined[b] += v * 0.20
-        for b, sc in sorted(combined.items(), key=lambda x: x[1], reverse=True):
-            st, en = _snap_to_hook_and_payoff([], max(0.0, (b * 10) - 5.0), (b * 10) + max_len, min_len, max_len, duration)
-            candidates.append((sc, st, en, f"Peak moment at {int(st)}s"))
+        for b, sc in sorted(audio_scores.items(), key=lambda x: x[1], reverse=True):
+            st, en = snap_hook_payoff([], max(0.0, b * 10 - 5.0), b * 10 + max_len, min_len, max_len, duration)
+            scored.append((sc, st, en, f"High-energy moment at {int(st)}s"))
 
-    candidates.sort(key=lambda x: x[0], reverse=True)
+    scored.sort(key=lambda x: x[0], reverse=True)
     picked = []
-    for sc, st, en, label in candidates:
+    for sc, st, en, title in scored:
         if any(abs(st - p["start"]) < max_len for p in picked):
             continue
-        picked.append({
-            "start": st,
-            "end": en,
-            "duration": round(en - st, 1),
-            "title": label,
-            "reason": f"Hook + payoff window (score {sc:.1f})",
-        })
+        picked.append({"start": st, "end": en, "duration": round(en - st, 1), "title": title, "reason": f"Hook+payoff score {sc:.1f}"})
         if len(picked) >= num_clips:
             break
     picked.sort(key=lambda x: x["start"])
     return picked
 
-def _fmt_ass_time(sec):
+def _fmt_ass(sec):
     sec = max(0.0, float(sec))
     h = int(sec // 3600)
     m = int((sec % 3600) // 60)
     s = sec % 60
     return f"{h}:{m:02d}:{s:05.2f}"
 
-def _escape_ass_text(txt):
-    txt = txt.replace("{", "(").replace("}", ")")
-    return re.sub(r"\s+", " ", txt).strip()
-
-def build_ass_subtitles(segments, clip_start, clip_end, ass_path, style_mode):
-    """Generates a styled .ass subtitle file aligned to [clip_start, clip_end]."""
-    clip_segs = [
-        s for s in (segments or [])
-        if s["end"] > clip_start and s["start"] < clip_end and s["text"].strip()
-    ]
-    if not clip_segs:
+def build_ass(segments, start_s, end_s, ass_path, style_mode):
+    segs = [s for s in (segments or []) if s["end"] > start_s and s["start"] < end_s and s["text"].strip()]
+    if not segs or style_mode == "none":
         return None
-
     if style_mode == "bold_shorts":
-        # Centered bold Shorts captions (Alignment=5 = middle-center, above bottom UI)
-        font_name, font_size, bold, alignment, margin_v = "Arial", 64, -1, 5, 120
-        primary, outline, back = "&H0000FFFF", "&H00000000", "&H80000000"
+        font_sz, bold, align, margin_v, color = 62, -1, 5, 120, "&H0000FFFF"
     else:
-        # Clean lower-third subtitles (Alignment=2 = bottom-center)
-        font_name, font_size, bold, alignment, margin_v = "Arial", 48, 0, 2, 180
-        primary, outline, back = "&H00FFFFFF", "&H00000000", "&H64000000"
+        font_sz, bold, align, margin_v, color = 46, 0, 2, 170, "&H00FFFFFF"
 
     header = (
-        "[Script Info]\n"
-        "ScriptType: v4.00+\n"
-        "PlayResX: 1080\n"
-        "PlayResY: 1920\n\n"
-        "[V4+ Styles]\n"
-        "Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, "
+        "[Script Info]\nScriptType: v4.00+\nPlayResX: 1080\nPlayResY: 1920\n\n"
+        "[V4+ Styles]\nFormat: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, "
         "Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, "
         "Alignment, MarginL, MarginR, MarginV, Encoding\n"
-        f"Style: Default,{font_name},{font_size},{primary},&H000000FF,{outline},{back},"
-        f"{bold},0,0,0,100,100,0,0,1,3,1,{alignment},60,60,{margin_v},1\n\n"
-        "[Events]\n"
-        "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n"
+        f"Style: Default,Arial,{font_sz},{color},&H000000FF,&H00000000,&H80000000,{bold},0,0,0,100,100,0,0,1,3,1,{align},60,60,{margin_v},1\n\n"
+        "[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n"
     )
-
-    events = []
-    for s in clip_segs:
-        rel_st = max(0.0, s["start"] - clip_start)
-        rel_en = min(clip_end - clip_start, s["end"] - clip_start)
-        if rel_en - rel_st < 0.25:
+    lines = []
+    for s in segs:
+        rel_s = max(0.0, s["start"] - start_s)
+        rel_e = min(end_s - start_s, s["end"] - start_s)
+        if rel_e - rel_s < 0.25:
             continue
-        words = _escape_ass_text(s["text"]).split()
-        # Chunk into short readable phrases (up to 5 words)
-        chunk_size = 4 if style_mode == "bold_shorts" else 6
-        chunks = [" ".join(words[i:i+chunk_size]) for i in range(0, len(words), chunk_size)]
-        chunk_dur = (rel_en - rel_st) / max(1, len(chunks))
+        words = re.sub(r"\s+", " ", s["text"].replace("{", "(").replace("}", ")")).strip().split()
+        step = 4 if style_mode == "bold_shorts" else 6
+        chunks = [" ".join(words[i:i + step]) for i in range(0, len(words), step)]
+        dur = (rel_e - rel_s) / max(1, len(chunks))
         for idx_c, ch in enumerate(chunks):
-            c_st = rel_st + (idx_c * chunk_dur)
-            c_en = min(rel_en, c_st + chunk_dur)
-            events.append(f"Dialogue: 0,{_fmt_ass_time(c_st)},{_fmt_ass_time(c_en)},Default,,0,0,0,,{ch}")
-
-    if not events:
+            cs = rel_s + idx_c * dur
+            ce = min(rel_e, cs + dur)
+            lines.append(f"Dialogue: 0,{_fmt_ass(cs)},{_fmt_ass(ce)},Default,,0,0,0,,{ch}")
+    if not lines:
         return None
-
     with open(ass_path, "w", encoding="utf-8") as f:
-        f.write(header + "\n".join(events) + "\n")
+        f.write(header + "\n".join(lines) + "\n")
     return ass_path
 
-def render_clip(url, idx, start, end, raw_dir, shorts_dir, segments=None, subtitles="none", cookies=None, split_cam=False):
-    raw_path = os.path.join(raw_dir, f"raw_{idx:03d}.mp4")
-    final_path = os.path.join(shorts_dir, f"short_{idx:03d}.mp4")
-    ass_path = os.path.join(raw_dir, f"sub_{idx:03d}.ass")
+def detect_fast_encoder():
+    res = subprocess.run(["ffmpeg", "-encoders"], capture_output=True, text=True)
+    enc_out = res.stdout
+    if "h264_nvenc" in enc_out and subprocess.run(["nvidia-smi"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0:
+        return ("h264_nvenc", ["-preset", "p2", "-cq", "24"])
+    if "h264_qsv" in enc_out:
+        return ("h264_qsv", ["-preset", "veryfast", "-b:v", "4.5M"])
+    return ("libx264", ["-preset", "veryfast", "-crf", "24"])
 
-    if os.path.exists(final_path) and os.path.getsize(final_path) > 0:
-        return final_path
+def fast_render_clip(src_mp4, idx, start_s, end_s, tmp_dir, final_dir, encoder_cfg, segments=None, subtitles="none", split_cam=False):
+    os.makedirs(final_dir, exist_ok=True)
+    out_mp4 = os.path.join(final_dir, f"short_{idx:03d}.mp4")
+    if os.path.exists(out_mp4) and os.path.getsize(out_mp4) > 0:
+        return out_mp4
 
-    section = f"*{int(start)}-{int(end)}"
-    dl_cmd = [
-        py_cmd(), "-m", "yt_dlp", "--download-sections", section, "--force-keyframes-at-cuts",
-        "-f", "bestvideo[height<=1080][ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]",
-        "-o", raw_path
-    ]
-    if cookies and os.path.exists(cookies):
-        dl_cmd += ["--cookies", cookies]
-    dl_cmd.append(url)
-    subprocess.run(dl_cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    if not os.path.exists(raw_path):
-        return None
-
+    dur = max(1.0, float(end_s) - float(start_s))
     if split_cam:
         vf = (
             "split[cam][game];"
@@ -416,29 +301,44 @@ def render_clip(url, idx, start, end, raw_dir, shorts_dir, segments=None, subtit
             "[top][bot]vstack"
         )
     else:
+        # Fast vertical framing: scaled foreground centered over dark/dimmed backdrop
         vf = (
             "split[orig][bg];"
-            "[bg]scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,gblur=sigma=20[blurred];"
-            "[orig]scale=1080:-1[fg];"
-            "[blurred][fg]overlay=(W-w)/2:(H-h)/2"
+            "[bg]scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,eq=brightness=-0.25[bgd];"
+            "[orig]scale=1080:-2[fg];"
+            "[bgd][fg]overlay=(W-w)/2:(H-h)/2"
         )
 
     if subtitles != "none":
-        built_ass = build_ass_subtitles(segments, start, end, ass_path, subtitles)
-        if built_ass:
-            escaped_path = os.path.abspath(built_ass).replace("\\", "/").replace(":", "\\:")
-            vf = f"{vf},ass='{escaped_path}'"
+        ass_file = os.path.join(tmp_dir, f"sub_{idx:03d}.ass")
+        built = build_ass(segments, start_s, end_s, ass_file, subtitles)
+        if built:
+            esc = os.path.abspath(built).replace("\\", "/").replace(":", "\\:")
+            vf = f"{vf},ass='{esc}'"
 
-    for encoder, extra in [
-        ("h264_nvenc", ["-preset", "p4", "-cq", "23"]),
-        ("h264_qsv", ["-b:v", "5M"]),
-        ("libx264", ["-preset", "ultrafast", "-crf", "23"]),
-    ]:
-        ff_cmd = ["ffmpeg", "-y", "-i", raw_path, "-vf", vf, "-c:v", encoder, *extra, "-c:a", "copy", final_path]
-        r = subprocess.run(ff_cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        if r.returncode == 0 and os.path.exists(final_path) and os.path.getsize(final_path) > 0:
-            return final_path
-    return None
+    enc_name, enc_args = encoder_cfg
+    # Fast input seeking (-ss before -i) so FFmpeg jumps straight to start_s
+    cmd = [
+        "ffmpeg", "-y",
+        "-ss", f"{start_s:.2f}", "-t", f"{dur:.2f}", "-i", src_mp4,
+        "-vf", vf,
+        "-c:v", enc_name, *enc_args,
+        "-c:a", "aac", "-b:a", "128k",
+        out_mp4
+    ]
+    r = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    if r.returncode != 0 and enc_name != "libx264":
+        fallback_cmd = [
+            "ffmpeg", "-y",
+            "-ss", f"{start_s:.2f}", "-t", f"{dur:.2f}", "-i", src_mp4,
+            "-vf", vf,
+            "-c:v", "libx264", "-preset", "veryfast", "-crf", "24",
+            "-c:a", "aac", "-b:a", "128k",
+            out_mp4
+        ]
+        subprocess.run(fallback_cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+    return out_mp4 if (os.path.exists(out_mp4) and os.path.getsize(out_mp4) > 0) else None
 
 def write_reports(session_dir, title, url, rows):
     trans_dir = os.path.join(session_dir, "transcript")
@@ -446,39 +346,37 @@ def write_reports(session_dir, title, url, rows):
     os.makedirs(trans_dir, exist_ok=True)
     os.makedirs(rep_dir, exist_ok=True)
 
-    json_path = os.path.join(trans_dir, "clips.json")
-    csv_path = os.path.join(trans_dir, "clips.csv")
-    html_path = os.path.join(rep_dir, "index.html")
-
-    with open(json_path, "w", encoding="utf-8") as f:
+    with open(os.path.join(trans_dir, "clips.json"), "w", encoding="utf-8") as f:
         json.dump(rows, f, indent=2)
 
-    with open(csv_path, "w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=["clip", "start", "end", "duration", "title", "reason", "file"])
-        writer.writeheader()
-        writer.writerows(rows)
+    with open(os.path.join(trans_dir, "clips.csv"), "w", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=["clip", "start", "end", "duration", "title", "reason", "file"])
+        w.writeheader()
+        w.writerows(rows)
 
     trs = "\n".join(
         f"<tr><td>{r['clip']}</td><td>{r['start']}s - {r['end']}s</td><td>{r['duration']}s</td><td>{r['title']}</td><td>{r['reason']}</td><td>{r['file']}</td></tr>"
         for r in rows
     )
     html = (
-        f"<!doctype html><html><head><meta charset='utf-8'><title>StreamClipper Report - {title}</title>"
+        f"<!doctype html><html><head><meta charset='utf-8'><title>StreamClipper - {title}</title>"
         f"<style>body{{font-family:sans-serif;background:#0f1115;color:#eee;padding:24px}}table{{width:100%;border-collapse:collapse}}th,td{{border:1px solid #2b303c;padding:8px;text-align:left}}th{{background:#1b202b}}</style></head>"
-        f"<body><h1>{title}</h1><p>Source: {url}</p><table><thead><tr><th>#</th><th>Range</th><th>Duration</th><th>Hook/Title</th><th>Payoff Reason</th><th>Output File</th></tr></thead><tbody>{trs}</tbody></table></body></html>"
+        f"<body><h1>{title}</h1><p>Source: {url}</p><table><thead><tr><th>#</th><th>Range</th><th>Duration</th><th>Hook/Title</th><th>Payoff Reason</th><th>File</th></tr></thead><tbody>{trs}</tbody></table></body></html>"
     )
-    with open(html_path, "w", encoding="utf-8") as f:
+    with open(os.path.join(rep_dir, "index.html"), "w", encoding="utf-8") as f:
         f.write(html)
 
 def main():
-    parser = argparse.ArgumentParser(description="StreamClipper Hook + Payoff Vertical Shorts Generator (Max 50s)")
-    parser.add_argument("url", help="YouTube, Twitch, or Kick stream/VOD URL")
-    parser.add_argument("--clips", type=int, default=40)
+    t0 = time.time()
+    parser = argparse.ArgumentParser(description="Fast OpusClip-Style Hook + Payoff Shorts Clipper (Max 50s)")
+    parser.add_argument("url")
+    parser.add_argument("--clips", type=int, default=30)
     parser.add_argument("--min-len", type=int, default=25)
     parser.add_argument("--max-len", type=int, default=50)
     parser.add_argument("--out", default="StreamClipper")
+    parser.add_argument("--work-dir", default="/tmp/streamclipper_fast" if os.name != "nt" else r"D:\hype-clipper\.fast_work")
+    parser.add_argument("--max-height", type=int, default=1080)
     parser.add_argument("--cookies", default=None)
-    parser.add_argument("--chat-box", choices=["left", "right", "none"], default="right")
     parser.add_argument("--split-cam", action="store_true")
     parser.add_argument("--subtitles", choices=["none", "clean", "bold_shorts"], default="bold_shorts")
     parser.add_argument("--ai-provider", choices=["auto", "groq", "gemini", "ollama", "heuristic"], default="auto")
@@ -490,38 +388,46 @@ def main():
 
     meta = get_metadata(args.url, args.cookies)
     title = meta.get("title") or "Stream"
-    duration = float(meta.get("duration") or 36000)
-    session_id = hashlib.md5(f"{args.url}|{min_len}|{max_len}|{args.subtitles}".encode()).hexdigest()[:10]
-    session_dir = os.path.join(args.out, session_id)
+    duration = float(meta.get("duration") or 3600)
+    sid = hashlib.md5(f"{args.url}|{min_len}|{max_len}|{args.subtitles}".encode()).hexdigest()[:10]
 
-    raw_dir = os.path.join(session_dir, "raw")
-    shorts_dir = os.path.join(session_dir, "shorts")
-    trans_dir = os.path.join(session_dir, "transcript")
-    os.makedirs(raw_dir, exist_ok=True)
-    os.makedirs(shorts_dir, exist_ok=True)
-    os.makedirs(trans_dir, exist_ok=True)
+    local_work = os.path.join(args.work_dir, sid)
+    local_shorts = os.path.join(local_work, "shorts")
+    os.makedirs(local_work, exist_ok=True)
+    os.makedirs(local_shorts, exist_ok=True)
 
-    print(f"Stream: {title} ({int(duration // 60)}m) | Subtitles: {args.subtitles} | Length: {min_len}s-{max_len}s")
+    final_session_dir = os.path.join(args.out, sid)
+    final_shorts_dir = os.path.join(final_session_dir, "shorts")
+    os.makedirs(final_shorts_dir, exist_ok=True)
 
-    audio_path = download_audio(args.url, os.path.join(raw_dir, "source_audio.m4a"), args.cookies)
-    cache_json = os.path.join(trans_dir, "transcript.json")
-    segments = transcribe_segments(audio_path, cache_json) if audio_path else []
-    audio_scores = score_audio_variation(audio_path)
-    chat_scores, motion_scores = score_chat_and_motion(args.url, duration, args.chat_box, args.cookies)
+    src_mp4 = download_source_once(args.url, os.path.join(local_work, "source.mp4"), args.cookies, args.max_height)
+    wav_path = extract_audio_wav(src_mp4, os.path.join(local_work, "audio.wav"))
+    segments = transcribe_segments(wav_path, os.path.join(local_work, "transcript.json")) if wav_path else []
+    audio_scores = score_audio_peaks(wav_path)
 
-    print("[4/4] Selecting hook-to-payoff clips (<= 50s)...")
     selected = select_clips(
-        segments, audio_scores, chat_scores, motion_scores, duration,
-        args.clips, min_len, max_len, args.ai_provider, args.ollama_model
+        segments, audio_scores, duration, args.clips, min_len, max_len, args.ai_provider, args.ollama_model
     )
+
+    enc_cfg = detect_fast_encoder()
+    print(f"[4/4] Fast-rendering {len(selected)} clips ({min_len}s-{max_len}s) using {enc_cfg[0]}...")
 
     rows = []
     for i, c in enumerate(selected, 1):
-        print(f"[{i}/{len(selected)}] {c['start']}s -> {c['end']}s ({c['duration']}s) | {c['title']}")
-        out_mp4 = render_clip(
-            args.url, i, c["start"], c["end"], raw_dir, shorts_dir,
-            segments=segments, subtitles=args.subtitles, cookies=args.cookies, split_cam=args.split_cam
+        c_start = time.time()
+        out_local = fast_render_clip(
+            src_mp4, i, c["start"], c["end"], local_work, local_shorts,
+            enc_cfg, segments=segments, subtitles=args.subtitles, split_cam=args.split_cam
         )
+        fname = f"short_{i:03d}.mp4"
+        dest_file = os.path.join(final_shorts_dir, fname)
+        if out_local and os.path.exists(out_local):
+            shutil.copy2(out_local, dest_file)
+            status_file = fname
+        else:
+            status_file = "FAILED"
+
+        print(f"  [{i}/{len(selected)}] {c['start']}s->{c['end']}s ({c['duration']}s) in {time.time() - c_start:.1f}s | {c['title']}")
         rows.append({
             "clip": i,
             "start": c["start"],
@@ -529,11 +435,11 @@ def main():
             "duration": c["duration"],
             "title": c["title"],
             "reason": c["reason"],
-            "file": os.path.basename(out_mp4) if out_mp4 else "FAILED",
+            "file": status_file,
         })
 
-    write_reports(session_dir, title, args.url, rows)
-    print(f"\nDONE! Clips & report saved in: {session_dir}")
+    write_reports(final_session_dir, title, args.url, rows)
+    print(f"\nDONE in {time.time() - t0:.1f}s total! Output: {final_session_dir}")
 
 if __name__ == "__main__":
     main()
