@@ -1,6 +1,6 @@
-﻿import argparse, csv, hashlib, json, os, re, shutil, subprocess, time, wave
+﻿import argparse, csv, hashlib, json, os, re, shutil, subprocess, sys, time, wave
 from collections import defaultdict
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ProcessPoolExecutor, as_completed
 import numpy as np
 import requests
 
@@ -18,7 +18,6 @@ def py_cmd():
 
 def get_metadata(url, cookies=None):
     if os.path.isfile(url):
-        # Local or Google Drive video file
         probe = subprocess.run(
             ["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "default=noprint_wrappers=1:nokey=1", url],
             capture_output=True, text=True
@@ -32,18 +31,18 @@ def get_metadata(url, cookies=None):
     cmd.append(url)
     res = subprocess.run(cmd, capture_output=True, text=True)
     if res.returncode != 0:
-        raise RuntimeError(f"yt-dlp metadata failed:\n{res.stderr[-1000:]}")
+        raise RuntimeError(f"yt-dlp metadata failed:\n{res.stderr[-1200:]}")
     return json.loads(res.stdout)
 
 def download_source_1080p(url, dest_mp4, cookies=None, min_height=1080):
     if os.path.isfile(url):
-        print(f"[1/4] Using local/Drive video directly: {url}")
+        print(f"[1/4] Using local/Drive video: {url}")
         return url
     if os.path.exists(dest_mp4) and os.path.getsize(dest_mp4) > 1024 * 1024:
-        print(f"[1/4] Using cached local source: {dest_mp4}")
+        print(f"[1/4] Reusing cached source video: {dest_mp4}")
         return dest_mp4
 
-    print(f"[1/4] Fast-downloading source (>= {min_height}p, 8 parallel fragments)...")
+    print(f"[1/4] Downloading source (>= {min_height}p) with 12 parallel fragments...")
     fmt = (
         f"bestvideo[height>={min_height}][ext=mp4]+bestaudio[ext=m4a]/"
         f"bestvideo[height>={min_height}]+bestaudio/"
@@ -51,7 +50,8 @@ def download_source_1080p(url, dest_mp4, cookies=None, min_height=1080):
     )
     cmd = [
         py_cmd(), "-m", "yt_dlp",
-        "-N", "8",
+        "-N", "12",
+        "--concurrent-fragments", "12",
         "-f", fmt,
         "--merge-output-format", "mp4",
         "-o", dest_mp4
@@ -67,10 +67,8 @@ def download_source_1080p(url, dest_mp4, cookies=None, min_height=1080):
 def extract_audio_wav(video_path, wav_path):
     if os.path.exists(wav_path) and os.path.getsize(wav_path) > 1024:
         return wav_path
-    cmd = ["ffmpeg", "-y", "-i", video_path, "-vn", "-ac", "1", "-ar", "16000", "-c:a", "pcm_s16le", wav_path]
-    r = subprocess.run(cmd, capture_output=True, text=True)
-    if r.returncode != 0:
-        print("  -> Audio extraction warning:", r.stderr[-400:])
+    cmd = ["ffmpeg", "-y", "-hide_banner", "-loglevel", "error", "-i", video_path, "-vn", "-ac", "1", "-ar", "16000", "-c:a", "pcm_s16le", wav_path]
+    subprocess.run(cmd, capture_output=True, text=True)
     return wav_path if os.path.exists(wav_path) else None
 
 def transcribe_segments(wav_path, cache_json):
@@ -84,7 +82,7 @@ def transcribe_segments(wav_path, cache_json):
         except Exception:
             pass
 
-    print("[2/4] Fast-transcribing with faster-whisper...")
+    print("[2/4] Transcribing speech with faster-whisper...")
     try:
         from faster_whisper import WhisperModel
         has_gpu = subprocess.run(["nvidia-smi"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0
@@ -99,11 +97,10 @@ def transcribe_segments(wav_path, cache_json):
         print(f"  -> Transcribed {len(out)} segments on {device.upper()} ({model_name}).")
         return out
     except Exception as e:
-        print(f"  -> Whisper skipped ({e}); falling back to audio energy scoring.")
+        print(f"  -> Whisper skipped ({e}); falling back to audio peaks.")
         return []
 
 def score_audio_peaks_fast(wav_path, bucket_sec=10):
-    """Computes RMS audio excitement jumps directly in NumPy (< 1 sec even for multi-hour streams)."""
     deltas = defaultdict(float)
     if not wav_path or not os.path.exists(wav_path):
         return deltas
@@ -119,19 +116,17 @@ def score_audio_peaks_fast(wav_path, bucket_sec=10):
                 samples = np.frombuffer(raw, dtype=np.int16).astype(np.float32) / 32768.0
                 if samples.size == 0:
                     continue
-                rms = float(np.sqrt(np.mean(samples * samples)) + 1e-8)
-                db = 20.0 * np.log10(rms)
+                db = 20.0 * np.log10(float(np.sqrt(np.mean(samples * samples)) + 1e-8))
                 rms_vals.append(db)
-
         for i, db in enumerate(rms_vals):
             prev = rms_vals[i - 1] if i > 0 else db
-            jump = max(0.0, db - prev)
-            deltas[i] = (jump * 2.5) + max(0.0, db + 35.0)
+            deltas[i] = max(0.0, db - prev) * 2.5 + max(0.0, db + 35.0)
     except Exception as e:
-        print(f"  -> Fast audio scoring warning: {e}")
+        print(f"  -> Audio scoring warning: {e}")
     return deltas
 
 def snap_hook_payoff(segments, start_s, end_s, min_len, max_len, duration):
+    """Guarantees min_len <= duration <= max_len, starts on hook/setup, and holds through payoff/ending."""
     start = max(0.0, float(start_s))
     end = min(float(duration), float(end_s))
     if end - start < min_len:
@@ -142,22 +137,21 @@ def snap_hook_payoff(segments, start_s, end_s, min_len, max_len, duration):
     if not segments:
         return round(start, 2), round(min(float(duration), end), 2)
 
-    hook_re = re.compile(r"\b(wait|what|why|how|no way|bro|crazy|insane|look|watch|secret|never|caught|mistake|truth|stop|listen|holy)\b", re.I)
+    hook_re = re.compile(r"\b(wait|what|why|how|no way|bro|crazy|insane|look|watch|secret|never|caught|mistake|truth|stop|listen|holy|check this)\b", re.I)
     for s in reversed(segments):
         if start - 8.0 <= s["start"] <= start + 2.0 and hook_re.search(s["text"]):
             start = max(0.0, s["start"] - 1.0)
             break
 
-    best_end = min(float(duration), start + max_len, max(end, start + min_len))
-    for s in segments:
-        if s["end"] < start + min_len:
-            continue
-        if s["end"] - start > max_len:
-            break
-        if re.search(r"[.!?]$", s["text"].strip()):
-            best_end = min(float(duration), s["end"] + 0.7)
-            break
-        best_end = min(float(duration), s["end"] + 0.4)
+    # Hold through complete sentences/payoff up to max_len (never cut off early like a 13s fragment)
+    best_end = min(float(duration), start + max_len)
+    sentence_ends = [s["end"] + 0.7 for s in segments if s["end"] >= start + min_len and s["end"] - start <= max_len and re.search(r"[.!?]$", s["text"].strip())]
+    if sentence_ends:
+        best_end = min(float(duration), max(sentence_ends))
+    else:
+        seg_ends = [s["end"] + 0.4 for s in segments if s["end"] >= start + min_len and s["end"] - start <= max_len]
+        if seg_ends:
+            best_end = min(float(duration), max(seg_ends))
 
     if best_end - start < min_len:
         best_end = min(float(duration), start + min_len)
@@ -220,15 +214,13 @@ def _call_free_ai_chunk(prompt, provider, ollama_model):
     return ""
 
 def select_clips_full_stream(segments, audio_scores, duration, num_clips, min_len, max_len, provider, ollama_model):
-    """Covers the ENTIRE stream in chunks so 40+ meaningful hook-to-payoff clips are found."""
-    print(f"[3/4] Selecting up to {num_clips} hook-to-payoff clips ({min_len}s-{max_len}s) across full stream...")
+    print(f"[3/4] Selecting {num_clips} hook-to-payoff clips ({min_len}s-{max_len}s) across full stream...")
     picked = []
 
-    # 1. Chunked AI pass across the full transcript (300 segments per chunk)
     if segments and provider != "heuristic":
-        chunk_size = 300
+        chunk_size = 320
         num_chunks = max(1, (len(segments) + chunk_size - 1) // chunk_size)
-        per_chunk = max(3, (num_clips + num_chunks - 1) // num_chunks + 2)
+        per_chunk = max(4, (num_clips + num_chunks - 1) // num_chunks + 3)
 
         for c_idx in range(num_chunks):
             chunk = segments[c_idx * chunk_size : (c_idx + 1) * chunk_size]
@@ -236,17 +228,17 @@ def select_clips_full_stream(segments, audio_scores, duration, num_clips, min_le
                 continue
             lines = "\n".join(f"[{int(s['start'])}s-{int(s['end'])}s] {s['text']}" for s in chunk)
             prompt = (
-                f"Pick up to {per_chunk} viral Short-form clips from this transcript section.\n"
+                f"Pick up to {per_chunk} high-retention Short-form clips from this transcript chunk.\n"
                 f"Rules:\n"
-                f"1. Start on a strong HOOK and end on a complete PAYOFF/PUNCHLINE/RESOLUTION (never cut mid-thought).\n"
+                f"1. Every clip MUST open with a strong HOOK and continue through a full PAYOFF/PUNCHLINE/ENDING.\n"
                 f"2. Duration MUST be between {min_len} and {max_len} seconds (strictly <= {max_len}s).\n"
-                f"3. Return ONLY JSON: [{{\"start\": 120, \"end\": 162, \"title\": \"Short Hook\", \"reason\": \"Hook + payoff\"}}].\n\n"
+                f"3. Return ONLY JSON: [{{\"start\": 120, \"end\": 165, \"title\": \"Hook Title\", \"reason\": \"Hook + payoff\"}}].\n\n"
                 f"Transcript:\n{lines}"
             )
             raw = _call_free_ai_chunk(prompt, provider, ollama_model)
             for item in _parse_ai_json(raw):
                 st, en = snap_hook_payoff(segments, item.get("start", 0), item.get("end", 0), min_len, max_len, duration)
-                if en - st >= min(min_len, 15) and not any(abs(st - p["start"]) < max_len * 0.75 for p in picked):
+                if en - st >= min(min_len, 20) and not any(abs(st - p["start"]) < max_len * 0.8 for p in picked):
                     picked.append({
                         "start": st, "end": en, "duration": round(en - st, 1),
                         "title": str(item.get("title", "Hook + Payoff"))[:80],
@@ -255,9 +247,8 @@ def select_clips_full_stream(segments, audio_scores, duration, num_clips, min_le
             if len(picked) >= num_clips:
                 break
 
-    # 2. Top up to num_clips using fast hook + audio-energy scoring across the full stream
     if len(picked) < num_clips:
-        hook_re = re.compile(r"\b(wait|what|why|how|no way|bro|crazy|insane|look|watch|secret|never|caught|mistake|truth|stop|listen|holy)\b", re.I)
+        hook_re = re.compile(r"\b(wait|what|why|how|no way|bro|crazy|insane|look|watch|secret|never|caught|mistake|truth|stop|listen|holy|check this)\b", re.I)
         scored = []
         if segments:
             for seg in segments:
@@ -272,7 +263,7 @@ def select_clips_full_stream(segments, audio_scores, duration, num_clips, min_le
 
         scored.sort(key=lambda x: x[0], reverse=True)
         for sc, st, en, title in scored:
-            if any(abs(st - p["start"]) < max_len * 0.75 for p in picked):
+            if any(abs(st - p["start"]) < max_len * 0.8 for p in picked):
                 continue
             picked.append({
                 "start": st, "end": en, "duration": round(en - st, 1),
@@ -301,12 +292,12 @@ def _style_params(style_name):
         "beast-bold":        ("Impact", 74, "&H00FFFFFF", "&H00000000", "&H90000000", -1, 1, 5, 3, 5, 90,  2, "phrase"),
         "karaoke-highlight": ("Arial", 62, "&H0000FF88", "&H00000000", "&H80000000", -1, 1, 3, 1, 5, 120, 4, "phrase"),
         "word-by-word":      ("Impact", 82, "&H0000FFFF", "&H00000000", "&H00000000", -1, 1, 5, 2, 5, 100, 1, "word"),
-        "two-line-stack":    ("Arial", 56, "&H00FFFFFF", "&H00000000", "&H80000000", -1, 1, 3, 2, 5, 120, 6, "phrase"),
+        "two-line-stack":    ("Arial", 56, "&H00FFFFFF", "&H00000000", "&H88000000", -1, 1, 3, 2, 5, 120, 6, "phrase"),
         "highlight-box":     ("Arial", 58, "&H00000000", "&H0000FFFF", "&HFF00FFFF", -1, 3, 2, 0, 5, 120, 3, "phrase"),
         "neon-glow":         ("Arial", 64, "&H00FFFF00", "&H00FFAA00", "&H80000000", -1, 1, 4, 3, 5, 120, 3, "phrase"),
         "impact-shake":      ("Impact", 72, "&H003366FF", "&H00000000", "&H80000000", -1, 1, 4, 2, 5, 100, 2, "phrase"),
         "emoji-pop":         ("Arial", 62, "&H00FFFFFF", "&H00000000", "&H80000000", -1, 1, 3, 2, 5, 120, 3, "emoji"),
-        "typewriter":        ("Courier New", 54, "&H00FFFFFF", "&H00000000", "&H80000000", -1, 1, 2, 1, 5, 130, 1, "word"),
+        "typewriter":        ("Courier New", 54, "&H00FFFFFF", "&H00000000", "&H88000000", -1, 1, 2, 1, 5, 130, 1, "word"),
         "bounce":            ("Arial", 66, "&H0066FFFF", "&H00000000", "&H80000000", -1, 1, 4, 2, 5, 110, 2, "phrase"),
         "gradient-stroke":   ("Arial", 66, "&H00FF66FF", "&H00FFCC00", "&H80000000", -1, 1, 4, 2, 5, 115, 3, "phrase"),
         "comic-burst":       ("Impact", 70, "&H003355FF", "&H0000FFFF", "&H80000000", -1, 1, 4, 2, 5, 115, 2, "phrase"),
@@ -368,12 +359,13 @@ def detect_fast_1080p_encoder():
     enc = res.stdout
     has_nv = subprocess.run(["nvidia-smi"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0
     if "h264_nvenc" in enc and has_nv:
-        return ("h264_nvenc", ["-preset", "p2", "-b:v", "8M", "-maxrate", "12M", "-bufsize", "16M"])
+        return ("h264_nvenc", ["-preset", "p1", "-b:v", "8M", "-maxrate", "12M", "-bufsize", "16M"])
     if "h264_qsv" in enc:
-        return ("h264_qsv", ["-preset", "fast", "-b:v", "8M", "-maxrate", "12M"])
-    return ("libx264", ["-preset", "veryfast", "-crf", "20"])
+        return ("h264_qsv", ["-preset", "veryfast", "-b:v", "8M", "-maxrate", "12M"])
+    return ("libx264", ["-preset", "ultrafast", "-crf", "21"])
 
-def render_one_clip(src_mp4, idx, clip, tmp_dir, local_shorts, final_shorts, enc_cfg, segments, caption_style, hook_style, split_cam):
+def _render_worker(args_tuple):
+    src_mp4, idx, clip, tmp_dir, local_shorts, final_shorts, enc_name, enc_args, segments, caption_style, hook_style, split_cam = args_tuple
     t0 = time.time()
     fname = f"short_{idx:03d}.mp4"
     final_path = os.path.join(final_shorts, fname)
@@ -384,7 +376,6 @@ def render_one_clip(src_mp4, idx, clip, tmp_dir, local_shorts, final_shorts, enc
     start_s, end_s = clip["start"], clip["end"]
     dur = max(1.0, float(end_s) - float(start_s))
 
-    # Fixed filter syntax: flags=lanczos belongs on scale, NEVER on crop
     if split_cam:
         vf = (
             "split[cam][game];"
@@ -406,7 +397,6 @@ def render_one_clip(src_mp4, idx, clip, tmp_dir, local_shorts, final_shorts, enc
         esc = os.path.abspath(built).replace("\\", "/").replace(":", "\\:")
         vf = f"{vf},ass='{esc}'"
 
-    enc_name, enc_args = enc_cfg
     cmd = [
         "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
         "-ss", f"{start_s:.2f}", "-t", f"{dur:.2f}", "-i", src_mp4,
@@ -421,7 +411,7 @@ def render_one_clip(src_mp4, idx, clip, tmp_dir, local_shorts, final_shorts, enc
             "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
             "-ss", f"{start_s:.2f}", "-t", f"{dur:.2f}", "-i", src_mp4,
             "-vf", vf,
-            "-c:v", "libx264", "-preset", "veryfast", "-crf", "20",
+            "-c:v", "libx264", "-preset", "ultrafast", "-crf", "21",
             "-c:a", "aac", "-b:a", "192k",
             out_local
         ]
@@ -430,7 +420,7 @@ def render_one_clip(src_mp4, idx, clip, tmp_dir, local_shorts, final_shorts, enc
     if os.path.exists(out_local) and os.path.getsize(out_local) > 10240:
         shutil.copy2(out_local, final_path)
         return idx, fname, time.time() - t0, None
-    return idx, "FAILED", time.time() - t0, r.stderr.strip()[-300:]
+    return idx, "FAILED", time.time() - t0, (r.stderr or "").strip()[-300:]
 
 def write_reports(session_dir, title, url, rows):
     trans_dir = os.path.join(session_dir, "transcript")
@@ -450,7 +440,7 @@ def write_reports(session_dir, title, url, rows):
         for r in rows
     )
     html = (
-        f"<!doctype html><html><head><meta charset='utf-8'><title>StreamClipper 1080p - {title}</title>"
+        f"<!doctype html><html><head><meta charset='utf-8'><title>HypeClipper 1080p - {title}</title>"
         f"<style>body{{font-family:sans-serif;background:#0f1115;color:#eee;padding:24px}}table{{width:100%;border-collapse:collapse}}th,td{{border:1px solid #2b303c;padding:8px;text-align:left}}th{{background:#1b202b}}</style></head>"
         f"<body><h1>{title}</h1><p>Source: {url}</p><table><thead><tr><th>#</th><th>Range</th><th>Duration</th><th>Hook/Title</th><th>Payoff Reason</th><th>File</th></tr></thead><tbody>{trs}</tbody></table></body></html>"
     )
@@ -459,15 +449,15 @@ def write_reports(session_dir, title, url, rows):
 
 def main():
     t0 = time.time()
-    parser = argparse.ArgumentParser(description="Optimized 1080p+ Hook & Payoff Shorts Generator (40+ clips, Parallel)")
+    parser = argparse.ArgumentParser(description="HypeClipper 1080p+ Hook & Payoff Shorts Engine (40+ clips, Multi-Process)")
     parser.add_argument("url")
     parser.add_argument("--clips", type=int, default=45)
     parser.add_argument("--min-len", type=int, default=25)
     parser.add_argument("--max-len", type=int, default=50)
     parser.add_argument("--min-height", type=int, default=1080)
-    parser.add_argument("--workers", type=int, default=3)
-    parser.add_argument("--out", default="StreamClipper")
-    parser.add_argument("--work-dir", default="/tmp/streamclipper_fast" if os.name != "nt" else r"D:\hype-clipper\.fast_work")
+    parser.add_argument("--workers", type=int, default=min(6, os.cpu_count() or 4))
+    parser.add_argument("--out", default="HypeClipper")
+    parser.add_argument("--work-dir", default="/tmp/hypeclipper_fast" if os.name != "nt" else r"D:\hype-clipper\.fast_work")
     parser.add_argument("--cookies", default=None)
     parser.add_argument("--split-cam", action="store_true")
     parser.add_argument("--caption-style", choices=CAPTION_STYLES, default="auto")
@@ -503,18 +493,21 @@ def main():
         segments, audio_scores, duration, args.clips, min_len, max_len, args.ai_provider, args.ollama_model
     )
 
-    enc_cfg = detect_fast_1080p_encoder()
-    print(f"[4/4] Parallel-rendering {len(selected)} 1080p Shorts ({args.workers} workers, {enc_cfg[0]})...")
+    enc_name, enc_args = detect_fast_1080p_encoder()
+    workers = 2 if enc_name == "h264_nvenc" else max(1, min(args.workers, os.cpu_count() or 4))
+    print(f"[4/4] Multi-process rendering {len(selected)} 1080p Shorts ({workers} workers, {enc_name})...")
+
+    tasks = [
+        (
+            src_mp4, i, c, local_work, local_shorts, final_shorts_dir,
+            enc_name, enc_args, segments, args.caption_style, args.hook_style, args.split_cam
+        )
+        for i, c in enumerate(selected, 1)
+    ]
 
     results_map = {}
-    with ThreadPoolExecutor(max_workers=max(1, args.workers)) as pool:
-        futures = {
-            pool.submit(
-                render_one_clip, src_mp4, i, c, local_work, local_shorts, final_shorts_dir,
-                enc_cfg, segments, args.caption_style, args.hook_style, args.split_cam
-            ): (i, c)
-            for i, c in enumerate(selected, 1)
-        }
+    with ProcessPoolExecutor(max_workers=workers) as pool:
+        futures = {pool.submit(_render_worker, t): (t[1], t[2]) for t in tasks}
         for fut in as_completed(futures):
             i, c = futures[fut]
             idx, fname, elapsed, err = fut.result()
