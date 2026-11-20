@@ -2,9 +2,13 @@
 from collections import defaultdict
 import cv2
 import numpy as np
+import requests
+
+def py_cmd():
+    return "py" if os.name == "nt" else "python3"
 
 def get_metadata(url, cookies=None):
-    cmd = ["py" if os.name == "nt" else "python3", "-m", "yt_dlp", "--dump-single-json", "--skip-download"]
+    cmd = [py_cmd(), "-m", "yt_dlp", "--dump-single-json", "--skip-download"]
     if cookies and os.path.exists(cookies):
         cmd += ["--cookies", cookies]
     cmd.append(url)
@@ -13,128 +17,49 @@ def get_metadata(url, cookies=None):
         raise RuntimeError(f"yt-dlp metadata failed:\n{res.stderr}")
     return json.loads(res.stdout)
 
-def score_chat_api(url, duration, bucket_sec=10):
-    print("[1/4] Checking YouTube/Twitch live chat replay API...")
-    chat_file = "temp_chat.json"
-    if os.path.exists(chat_file):
-        os.remove(chat_file)
-
-    py_bin = "py" if os.name == "nt" else "python3"
-    cmd = [py_bin, "-m", "chat_downloader", url, "--output", chat_file, "--quiet"]
-    subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-
-    buckets = defaultdict(int)
-    if not os.path.exists(chat_file):
-        print("  -> Live chat API unavailable; relying on on-screen chat motion + audio.")
-        return buckets
-
-    try:
-        with open(chat_file, "r", encoding="utf-8") as f:
-            messages = json.load(f)
-        for msg in messages:
-            t = msg.get("time_in_seconds", -1)
-            if 0 <= t <= duration:
-                buckets[int(t // bucket_sec)] += 1
-        print(f"  -> Parsed {len(messages)} chat messages across {len(buckets)} windows.")
-    except Exception:
-        print("  -> Chat parse skipped.")
-    finally:
-        if os.path.exists(chat_file):
-            os.remove(chat_file)
-    return buckets
-
-def score_onscreen_chat(url, chat_side="right", cookies=None, bucket_sec=10):
-    """Streams 360p video via FFmpeg pipe and measures pixel scroll velocity in the on-screen chat box."""
-    if chat_side == "none":
-        return {}
-    print(f"[2/4] Scanning on-screen chat box motion ({chat_side} side) at 2 FPS...")
-
-    py_bin = "py" if os.name == "nt" else "python3"
-    get_url_cmd = [py_bin, "-m", "yt_dlp", "-f", "best[height<=360]/worst", "-g"]
-    if cookies and os.path.exists(cookies):
-        get_url_cmd += ["--cookies", cookies]
-    get_url_cmd.append(url)
-    res = subprocess.run(get_url_cmd, capture_output=True, text=True)
-    stream_url = res.stdout.strip().splitlines()[0] if res.returncode == 0 and res.stdout.strip() else None
-
-    if not stream_url:
-        print("  -> Could not open low-res stream for visual chat scan; skipping.")
-        return {}
-
-    # Decode at 2 FPS, scale to 640x360 raw grayscale frames directly in RAM
-    w, h = 640, 360
-    ff_cmd = [
-        "ffmpeg", "-loglevel", "error", "-i", stream_url,
-        "-vf", f"fps=2,scale={w}:{h},format=gray",
-        "-f", "rawvideo", "-"
-    ]
-    proc = subprocess.Popen(ff_cmd, stdout=subprocess.PIPE, bufsize=w*h*4)
-
-    # Crop region for typical on-screen chat overlay (outer 26% width, middle-bottom 65% height)
-    y1, y2 = int(h * 0.25), int(h * 0.90)
-    if chat_side == "left":
-        x1, x2 = 0, int(w * 0.26)
-    else:
-        x1, x2 = int(w * 0.74), w
-
-    prev_crop = None
-    frame_idx = 0
-    bucket_motion = defaultdict(list)
-
-    while True:
-        raw = proc.stdout.read(w * h)
-        if len(raw) < w * h:
-            break
-        frame = np.frombuffer(raw, dtype=np.uint8).reshape((h, w))
-        crop = frame[y1:y2, x1:x2]
-
-        if prev_crop is not None:
-            # Measure mean absolute pixel change (text scrolling up causes sharp delta spikes)
-            diff = cv2.absdiff(crop, prev_crop)
-            # Threshold out minor compression noise, count moving text pixels
-            _, thresh = cv2.threshold(diff, 25, 255, cv2.THRESH_BINARY)
-            motion_score = float(np.mean(thresh))
-            t_sec = frame_idx * 0.5  # 2 FPS = 0.5s per frame
-            bucket_motion[int(t_sec // bucket_sec)].append(motion_score)
-
-        prev_crop = crop
-        frame_idx += 1
-
-    proc.wait()
-    averaged = {b: sum(vals) / len(vals) for b, vals in bucket_motion.items() if vals}
-    print(f"  -> Scanned {frame_idx} frames ({int(frame_idx * 0.5 // 60)} mins) for visual chat scroll spikes.")
-    return averaged
-
-def score_audio_variation(url, cookies=None, bucket_sec=10):
-    print("[3/4] Scanning audio variation (sudden volume jumps)...")
-    audio_file = "temp_audio.m4a"
-    if os.path.exists(audio_file):
-        os.remove(audio_file)
-
-    py_bin = "py" if os.name == "nt" else "python3"
-    cmd = [py_bin, "-m", "yt_dlp", "-f", "bestaudio[ext=m4a]/bestaudio", "-o", audio_file]
+def download_audio(url, out_path="temp_audio.m4a", cookies=None):
+    if os.path.exists(out_path):
+        os.remove(out_path)
+    cmd = [py_cmd(), "-m", "yt_dlp", "-f", "bestaudio[ext=m4a]/bestaudio", "-o", out_path]
     if cookies and os.path.exists(cookies):
         cmd += ["--cookies", cookies]
     cmd.append(url)
     subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    return out_path if os.path.exists(out_path) else None
 
+def transcribe_segments(audio_path):
+    """Fast Whisper transcription with timestamps so we can snap clips to hooks & endings."""
+    print("[1/4] Transcribing speech with faster-whisper...")
+    try:
+        from faster_whisper import WhisperModel
+        device = "cuda" if subprocess.run(["nvidia-smi"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0 else "cpu"
+        compute = "float16" if device == "cuda" else "int8"
+        model = WhisperModel("small", device=device, compute_type=compute)
+        segs, _ = model.transcribe(audio_path, beam_size=3, vad_filter=True)
+        out = []
+        for s in segs:
+            txt = s.text.strip()
+            if txt:
+                out.append({"start": float(s.start), "end": float(s.end), "text": txt})
+        print(f"  -> Captured {len(out)} speech segments on {device.upper()}.")
+        return out
+    except Exception as e:
+        print(f"  -> Whisper skipped ({e}); using audio + chat scoring.")
+        return []
+
+def score_audio_variation(audio_path, bucket_sec=10):
+    print("[2/4] Measuring audio excitement & volume jumps...")
     deltas = defaultdict(float)
-    if not os.path.exists(audio_file):
-        print("  -> Audio download failed; skipping audio scoring.")
+    if not audio_path or not os.path.exists(audio_path):
         return deltas
-
     ff_cmd = [
-        "ffmpeg", "-i", audio_file,
+        "ffmpeg", "-i", audio_path,
         "-af", "astats=metadata=1:reset=100,ametadata=print:key=lavfi.astats.Overall.RMS_level",
         "-f", "null", "-"
     ]
     res = subprocess.run(ff_cmd, capture_output=True, text=True)
-    if os.path.exists(audio_file):
-        os.remove(audio_file)
-
     times = re.findall(r"pts_time:([0-9.]+)", res.stderr)
     levels = re.findall(r"RMS_level=([-0-9.]+)", res.stderr)
-
     bucket_rms = defaultdict(list)
     for t, lvl in zip(times, levels):
         try:
@@ -143,31 +68,167 @@ def score_audio_variation(url, cookies=None, bucket_sec=10):
                 bucket_rms[int(float(t) // bucket_sec)].append(val)
         except ValueError:
             pass
-
     sorted_b = sorted(bucket_rms.keys())
     for i, b in enumerate(sorted_b):
         curr_max = max(bucket_rms[b])
         prev_avg = sum(bucket_rms[sorted_b[i-1]]) / len(bucket_rms[sorted_b[i-1]]) if i > 0 else curr_max
         jump = max(0.0, curr_max - prev_avg)
         deltas[b] = (jump * 2.0) + max(0.0, curr_max + 30.0)
-
-    print(f"  -> Scored {len(deltas)} audio windows.")
     return deltas
 
-def normalize(score_dict):
-    if not score_dict:
-        return {}
-    max_val = max(score_dict.values()) or 1.0
-    return {k: (v / max_val) * 100.0 for k, v in score_dict.items()}
+def score_chat_and_motion(url, duration, chat_side="right", cookies=None, bucket_sec=10):
+    print("[3/4] Checking chat velocity & on-screen chat motion...")
+    chat_file = "temp_chat.json"
+    if os.path.exists(chat_file):
+        os.remove(chat_file)
+    subprocess.run([py_cmd(), "-m", "chat_downloader", url, "--output", chat_file, "--quiet"],
+                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    chat_buckets = defaultdict(int)
+    if os.path.exists(chat_file):
+        try:
+            with open(chat_file, "r", encoding="utf-8") as f:
+                for msg in json.load(f):
+                    t = msg.get("time_in_seconds", -1)
+                    if 0 <= t <= duration:
+                        chat_buckets[int(t // bucket_sec)] += 1
+        except Exception:
+            pass
+        finally:
+            os.remove(chat_file)
+
+    motion_buckets = defaultdict(float)
+    if chat_side != "none":
+        get_cmd = [py_cmd(), "-m", "yt_dlp", "-f", "best[height<=360]/worst", "-g"]
+        if cookies and os.path.exists(cookies):
+            get_cmd += ["--cookies", cookies]
+        get_cmd.append(url)
+        r = subprocess.run(get_cmd, capture_output=True, text=True)
+        stream_url = r.stdout.strip().splitlines()[0] if r.returncode == 0 and r.stdout.strip() else None
+        if stream_url:
+            w, h = 640, 360
+            proc = subprocess.Popen(
+                ["ffmpeg", "-loglevel", "error", "-i", stream_url, "-vf", f"fps=2,scale={w}:{h},format=gray", "-f", "rawvideo", "-"],
+                stdout=subprocess.PIPE, bufsize=w*h*4
+            )
+            y1, y2 = int(h * 0.25), int(h * 0.90)
+            x1, x2 = (0, int(w * 0.26)) if chat_side == "left" else (int(w * 0.74), w)
+            prev_crop = None
+            idx = 0
+            b_vals = defaultdict(list)
+            while True:
+                raw = proc.stdout.read(w * h)
+                if len(raw) < w * h:
+                    break
+                crop = np.frombuffer(raw, dtype=np.uint8).reshape((h, w))[y1:y2, x1:x2]
+                if prev_crop is not None:
+                    diff = cv2.absdiff(crop, prev_crop)
+                    _, th = cv2.threshold(diff, 25, 255, cv2.THRESH_BINARY)
+                    b_vals[int((idx * 0.5) // bucket_sec)].append(float(np.mean(th)))
+                prev_crop = crop
+                idx += 1
+            proc.wait()
+            for b, vals in b_vals.items():
+                if vals:
+                    motion_buckets[b] = sum(vals) / len(vals)
+
+    return chat_buckets, motion_buckets
+
+def ai_select_hook_to_payoff_clips(segments, num_clips, min_len, max_len):
+    """Uses free Groq or Gemini API if key is set; otherwise builds complete hook-to-payoff windows."""
+    groq_key = os.environ.get("GROQ_API_KEY", "").strip()
+    gemini_key = os.environ.get("GEMINI_API_KEY", "").strip()
+
+    if segments and (groq_key or gemini_key):
+        compact = "\n".join(
+            f"[{int(s['start'])}s-{int(s['end'])}s] {s['text']}" for s in segments[:600]
+        )
+        prompt = (
+            f"Select up to {num_clips} engaging Short-form video clips from this transcript.\n"
+            f"Rules:\n"
+            f"1. Each clip MUST start on a strong hook/setup line and end on a complete payoff/punchline/resolution (never cut mid-sentence).\n"
+            f"2. Each clip duration MUST be between {min_len} and {max_len} seconds (strictly <= {max_len}s).\n"
+            f"3. Return ONLY a JSON list of objects: [{\"start\": 120, \"end\": 162, \"reason\": \"...\"}].\n\n"
+            f"Transcript:\n{compact}"
+        )
+        try:
+            if groq_key:
+                resp = requests.post(
+                    "https://api.groq.com/openai/v1/chat/completions",
+                    headers={"Authorization": f"Bearer {groq_key}", "Content-Type": "application/json"},
+                    json={"model": "llama-3.3-70b-versatile", "messages": [{"role": "user", "content": prompt}], "temperature": 0.3},
+                    timeout=45
+                )
+                content = resp.json()["choices"][0]["message"]["content"]
+            else:
+                resp = requests.post(
+                    f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={gemini_key}",
+                    json={"contents": [{"parts": [{"text": prompt}]}]},
+                    timeout=45
+                )
+                content = resp.json()["candidates"][0]["content"]["parts"][0]["text"]
+
+            match = re.search(r"\[[\s\S]*\]", content)
+            if match:
+                raw_clips = json.loads(match.group(0))
+                valid = []
+                for c in raw_clips:
+                    st = float(c.get("start", 0))
+                    en = float(c.get("end", 0))
+                    dur = en - st
+                    if dur < min_len:
+                        en = st + min_len
+                    elif dur > max_len:
+                        en = st + max_len
+                    valid.append((st, en, c.get("reason", "AI hook + payoff")))
+                if valid:
+                    print(f"  -> AI selected {len(valid)} hook-to-payoff clips ({min_len}s-{max_len}s).")
+                    return valid[:num_clips]
+        except Exception as e:
+            print(f"  -> AI API fallback ({e}); using transcript + energy window builder.")
+
+    # Structured hook-to-payoff window builder (no API key needed)
+    if segments:
+        hook_words = re.compile(r"\b(what|why|how|wait|bro|no way|crazy|secret|insane|look|watch|never|mistake|truth|caught)\b", re.I)
+        candidates = []
+        for i, seg in enumerate(segments):
+            hook_bonus = 25.0 if hook_words.search(seg["text"]) else 0.0
+            start = max(0.0, seg["start"] - 1.5)
+            end = start
+            text_acc = []
+            for j in range(i, len(segments)):
+                nxt_end = min(segments[j]["end"] + 1.0, start + max_len)
+                if nxt_end - start > max_len:
+                    break
+                end = nxt_end
+                text_acc.append(segments[j]["text"])
+                # Stop at a natural sentence boundary once minimum duration is reached
+                if (end - start) >= min_len and re.search(r"[.!?]$", segments[j]["text"].strip()):
+                    break
+            if (end - start) < min_len:
+                end = start + min_len
+            score = hook_bonus + min(30.0, len(" ".join(text_acc).split()) * 0.5)
+            candidates.append((score, start, end))
+
+        candidates.sort(reverse=True)
+        picked = []
+        for sc, st, en in candidates:
+            if any(abs(st - p_st) < max_len for p_st, _, _ in picked):
+                continue
+            picked.append((st, en, f"Score {sc:.0f}"))
+            if len(picked) >= num_clips:
+                break
+        picked.sort()
+        return picked
+
+    return []
 
 def render_clip(url, idx, start, end, out_dir, cookies=None, split_cam=False):
     raw_path = os.path.join(out_dir, "raw", f"raw_{idx:03d}.mp4")
     final_path = os.path.join(out_dir, "final_shorts", f"short_{idx:03d}.mp4")
     section = f"*{int(start)}-{int(end)}"
 
-    py_bin = "py" if os.name == "nt" else "python3"
     dl_cmd = [
-        py_bin, "-m", "yt_dlp", "--download-sections", section, "--force-keyframes-at-cuts",
+        py_cmd(), "-m", "yt_dlp", "--download-sections", section, "--force-keyframes-at-cuts",
         "-f", "bestvideo[height<=1080][ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]",
         "-o", raw_path
     ]
@@ -175,7 +236,6 @@ def render_clip(url, idx, start, end, out_dir, cookies=None, split_cam=False):
         dl_cmd += ["--cookies", cookies]
     dl_cmd.append(url)
     subprocess.run(dl_cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-
     if not os.path.exists(raw_path):
         return False
 
@@ -206,60 +266,64 @@ def render_clip(url, idx, start, end, out_dir, cookies=None, split_cam=False):
     return False
 
 def main():
-    parser = argparse.ArgumentParser(description="Multi-Signal Hype Clipper (API Chat + Visual Chat Motion + Audio Delta + Heatmap)")
+    parser = argparse.ArgumentParser(description="Hook + Payoff Vertical Shorts Clipper (Max 50s)")
     parser.add_argument("url", help="YouTube or Twitch stream/video URL")
     parser.add_argument("--clips", type=int, default=40, help="Number of clips (default: 40)")
-    parser.add_argument("--len", type=int, default=30, help="Clip length in seconds (default: 30)")
+    parser.add_argument("--min-len", type=int, default=25, help="Minimum clip seconds (default: 25)")
+    parser.add_argument("--max-len", type=int, default=50, help="Maximum clip seconds (default: 50)")
     parser.add_argument("--out", default=".", help="Output folder")
     parser.add_argument("--cookies", default=None, help="Path to cookies.txt")
-    parser.add_argument("--chat-box", choices=["left", "right", "none"], default="right", help="Side of screen where chat overlay sits (default: right)")
-    parser.add_argument("--split-cam", action="store_true", help="Stack top-left webcam over gameplay")
+    parser.add_argument("--chat-box", choices=["left", "right", "none"], default="right")
+    parser.add_argument("--split-cam", action="store_true")
     args = parser.parse_args()
+
+    max_len = min(args.max_len, 50)
+    min_len = min(args.min_len, max_len)
 
     os.makedirs(os.path.join(args.out, "raw"), exist_ok=True)
     os.makedirs(os.path.join(args.out, "final_shorts"), exist_ok=True)
 
     meta = get_metadata(args.url, args.cookies)
-    duration = meta.get("duration") or 36000
-    print(f"Loaded: {meta.get('title')} ({int(duration // 60)} mins)")
+    duration = float(meta.get("duration") or 36000)
+    print(f"Loaded: {meta.get('title')} ({int(duration // 60)} mins) | Target length: {min_len}s-{max_len}s")
 
-    chat_api_norm = normalize(score_chat_api(args.url, duration))
-    chat_vis_norm = normalize(score_onscreen_chat(args.url, args.chat_box, args.cookies))
-    audio_norm = normalize(score_audio_variation(args.url, args.cookies))
+    audio_path = download_audio(args.url, "temp_audio.m4a", args.cookies)
+    segments = transcribe_segments(audio_path) if audio_path else []
+    audio_scores = score_audio_variation(audio_path)
+    if audio_path and os.path.exists(audio_path):
+        os.remove(audio_path)
 
-    print("[4/4] Fusing all signals...")
-    heat_raw = defaultdict(float)
-    for item in (meta.get("heatmap") or []):
-        b = int(((item["start_time"] + item["end_time"]) / 2) // 10)
-        heat_raw[b] = max(heat_raw[b], item.get("value", 0))
-    heat_norm = normalize(heat_raw)
+    chat_scores, motion_scores = score_chat_and_motion(args.url, duration, args.chat_box, args.cookies)
 
-    all_buckets = set(chat_api_norm.keys()) | set(chat_vis_norm.keys()) | set(audio_norm.keys()) | set(heat_norm.keys())
-    fused = []
-    for b in all_buckets:
-        # Use API chat if available, otherwise rely heavily on visual on-screen chat scroll velocity
-        chat_score = chat_api_norm.get(b, 0) if chat_api_norm else chat_vis_norm.get(b, 0)
-        score = (0.45 * chat_score) + (0.35 * audio_norm.get(b, 0)) + (0.20 * heat_norm.get(b, 0))
-        fused.append((score, b * 10))
+    print("[4/4] Selecting hook-to-payoff clips...")
+    clips = ai_select_hook_to_payoff_clips(segments, args.clips, min_len, max_len)
 
-    fused.sort(reverse=True)
-    selected = []
-    for score, center in fused:
-        start = max(0, center - (args.len // 2))
-        end = min(duration, start + args.len)
-        if any(abs(start - s) < (args.len - 5) for s, _, _ in selected):
-            continue
-        selected.append((start, end, round(score, 1)))
-        if len(selected) >= args.clips:
-            break
+    # Fallback if transcript was empty (e.g., pure gameplay/music)
+    if not clips:
+        combined = defaultdict(float)
+        for b, v in audio_scores.items():
+            combined[b] += v * 0.45
+        for b, v in motion_scores.items():
+            combined[b] += v * 0.35
+        for b, v in chat_scores.items():
+            combined[b] += v * 0.20
+        ranked = sorted(combined.items(), key=lambda x: x[1], reverse=True)
+        for b, sc in ranked:
+            st = max(0.0, (b * 10) - 5.0)
+            en = min(duration, st + min(max_len, max(min_len, 40)))
+            if any(abs(st - p_st) < max_len for p_st, _, _ in clips):
+                continue
+            clips.append((st, en, f"Energy {sc:.1f}"))
+            if len(clips) >= args.clips:
+                break
+        clips.sort()
 
-    selected.sort()
-    print(f"\nRendering top {len(selected)} multi-signal clips into {os.path.abspath(os.path.join(args.out, 'final_shorts'))} ...\n")
-    for i, (s, e, sc) in enumerate(selected, 1):
-        print(f"[{i}/{len(selected)}] {int(s)}s -> {int(e)}s (Hype Score: {sc}/100)")
-        render_clip(args.url, i, s, e, args.out, args.cookies, args.split_cam)
+    for idx, (st, en, info) in enumerate(clips, 1):
+        en = min(duration, st + min(max_len, max(min_len, en - st)))
+        print(f"[{idx}/{len(clips)}] {int(st)}s -> {int(en)}s ({int(en - st)}s) | {info}")
+        render_clip(args.url, idx, st, en, args.out, args.cookies, args.split_cam)
 
-    print("\nDONE! All vertical Shorts are ready.")
+    print("\nDONE! Check final_shorts for complete hook-to-payoff vertical videos (<= 50s).")
 
 if __name__ == "__main__":
     main()
