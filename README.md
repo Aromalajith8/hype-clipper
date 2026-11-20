@@ -1,4 +1,4 @@
-﻿# HypeClipper
+# HypeClipper
 
 [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/Aromalajith8/hype-clipper/blob/main/Colab_Runner.ipynb)
 ![Python](https://img.shields.io/badge/Python-3.10%2B-blue)
@@ -8,7 +8,8 @@
 **HypeClipper** converts 40-minute to **10+ hour streams and VODs** into upload-ready **1080x1920 (9:16) vertical Shorts** with hook-to-payoff clipping (`25s-50s`), word-synced burned-in captions, customizable facecam framing, stereo intro SFX, and an automatic **Top 10 Viral** picks folder with thumbnails.
 
 ---
-
+<img width="2560" height="1440" alt="Logo 16 9@2x" src="https://github.com/user-attachments/assets/d859df14-d7d2-4426-88f4-0eade189deb9" />
+---
 ## Key Features
 
 - **10+ Hour VOD Ready (Surgical Range Fetch):** Automatically scouts long YouTube VODs using Replay Heatmaps, YouTube captions, and a zero-disk streaming NumPy audio scan—then downloads **only** the selected clips in 1080p instead of a 30 GB full stream.
