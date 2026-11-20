@@ -10,6 +10,7 @@
 ---
 <img width="2560" height="1440" alt="Logo 16 9@2x" src="https://github.com/user-attachments/assets/d859df14-d7d2-4426-88f4-0eade189deb9" />
 ---
+
 ## Key Features
 
 - **10+ Hour VOD Ready (Surgical Range Fetch):** Automatically scouts long YouTube VODs using Replay Heatmaps, YouTube captions, and a zero-disk streaming NumPy audio scan—then downloads **only** the selected clips in 1080p instead of a 30 GB full stream.
