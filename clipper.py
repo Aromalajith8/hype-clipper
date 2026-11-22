@@ -1,4 +1,4 @@
-﻿import argparse, csv, glob, hashlib, json, math, os, re, shutil, subprocess, sys, time, wave
+﻿import argparse, glob, hashlib, json, math, os, re, shutil, subprocess, sys, time, wave
 from collections import defaultdict
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
 import numpy as np
@@ -37,7 +37,6 @@ def has_ffmpeg_ass_filter():
     return bool(re.search(r"\bass\b", r.stdout or ""))
 
 def prepare_local_fonts(tmp_dir):
-    """Copies guaranteed bold TTF fonts into tmp_dir/fonts so libass never falls back to blank/missing fonts."""
     fonts_dir = os.path.join(tmp_dir, "fonts")
     os.makedirs(fonts_dir, exist_ok=True)
     candidates = [
@@ -107,7 +106,6 @@ def extract_heatmap_scores(meta, bucket_sec=10):
     return scores
 
 def fetch_youtube_captions(url, cache_dir, cookies=None):
-    """Fetches existing YouTube captions/auto-subs in ~5 seconds even for a 12-hour VOD (zero video download)."""
     cache_json = os.path.join(cache_dir, "yt_captions.json")
     if os.path.exists(cache_json):
         try:
@@ -158,7 +156,6 @@ def fetch_youtube_captions(url, cache_dir, cookies=None):
     except Exception:
         return []
 
-    # Merge tiny auto-sub fragments into readable ~6-second sentences
     merged = []
     for s in raw_segs:
         if merged and (s["start"] - merged[-1]["end"] < 1.2) and (s["end"] - merged[-1]["start"] < 6.5) and len(merged[-1]["text"]) < 95:
@@ -170,17 +167,16 @@ def fetch_youtube_captions(url, cache_dir, cookies=None):
     if merged:
         with open(cache_json, "w", encoding="utf-8") as f:
             json.dump(merged, f)
-        print(f"  -> Fetched {len(merged)} transcript blocks from YouTube captions in seconds!")
+        print(f"  -> Fetched {len(merged)} transcript blocks from YouTube captions.")
     return merged
 
 def download_audio_only(url, dest_m4a, cookies=None):
     if os.path.exists(dest_m4a) and os.path.getsize(dest_m4a) > 65536:
         return os.path.abspath(dest_m4a)
-    print("  -> Downloading lightweight audio-only track for 10h+ hype peak scanning...")
+    print("  -> Downloading lightweight audio-only track for hype peak scanning...")
     cmd = [
         py_cmd(), "-m", "yt_dlp", "-N", "16", "--concurrent-fragments", "16",
-        "-f", "bestaudio[ext=m4a]/bestaudio",
-        "-o", dest_m4a
+        "-f", "bestaudio[ext=m4a]/bestaudio", "-o", dest_m4a
     ]
     if cookies and os.path.exists(cookies):
         cmd += ["--cookies", cookies]
@@ -188,17 +184,14 @@ def download_audio_only(url, dest_m4a, cookies=None):
     r = subprocess.run(cmd, capture_output=True, text=True)
     if os.path.exists(dest_m4a) and os.path.getsize(dest_m4a) > 10240:
         return os.path.abspath(dest_m4a)
-    # yt-dlp may pick another audio extension if m4a isn't offered
-    matches = sorted(glob.glob(dest_m4a + "*"))
-    for m in matches:
+    for m in sorted(glob.glob(dest_m4a + "*")):
         if os.path.getsize(m) > 10240:
             return os.path.abspath(m)
     print(f"  -> Audio-only download warning: {(r.stderr or '')[-300:]}")
     return None
 
 def stream_audio_peaks_zero_disk(media_path, cache_json, bucket_sec=10):
-    """Streams 16kHz PCM directly from FFmpeg pipe into NumPy (<1 MB RAM, 0 bytes temp disk even on 24h streams)."""
-    if os.path.exists(cache_json):
+    if cache_json and os.path.exists(cache_json):
         try:
             with open(cache_json, "r", encoding="utf-8") as f:
                 raw = json.load(f)
@@ -211,13 +204,12 @@ def stream_audio_peaks_zero_disk(media_path, cache_json, bucket_sec=10):
     if not media_path or not os.path.exists(media_path):
         return deltas
 
-    print("  -> Streaming zero-disk NumPy audio energy scan...")
     cmd = [
         "ffmpeg", "-hide_banner", "-loglevel", "error",
         "-i", os.path.abspath(media_path),
         "-vn", "-ac", "1", "-ar", "16000", "-f", "s16le", "pipe:1"
     ]
-    bytes_per_bucket = 16000 * bucket_sec * 2
+    bytes_per_bucket = int(16000 * bucket_sec * 2)
     rms_vals = []
     try:
         proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
@@ -234,7 +226,7 @@ def stream_audio_peaks_zero_disk(media_path, cache_json, bucket_sec=10):
         for i, db in enumerate(rms_vals):
             prev = rms_vals[i - 1] if i > 0 else db
             deltas[i] = round(max(0.0, db - prev) * 2.5 + max(0.0, db + 35.0), 2)
-        if deltas:
+        if deltas and cache_json:
             with open(cache_json, "w", encoding="utf-8") as f:
                 json.dump({str(k): v for k, v in deltas.items()}, f)
     except Exception as e:
@@ -269,7 +261,6 @@ def download_source_1080p(url, dest_mp4, cookies=None, min_height=1080):
     return os.path.abspath(dest_mp4)
 
 def download_surgical_section(url, start_s, end_s, out_mp4, cookies=None, min_height=1080):
-    """Downloads ONLY a short 1080p segment from a 10+ hour YouTube VOD (~15 MB instead of 30 GB)."""
     if os.path.exists(out_mp4) and os.path.getsize(out_mp4) > 50000:
         return os.path.abspath(out_mp4), None
 
@@ -278,6 +269,7 @@ def download_surgical_section(url, start_s, end_s, out_mp4, cookies=None, min_he
     fmts = [
         f"bestvideo[height>={min_height}][ext=mp4]+bestaudio[ext=m4a]/bestvideo[height>={min_height}]+bestaudio/best[height>={min_height}]/best",
         "bestvideo[height>=720]+bestaudio/best",
+        "best",
     ]
     last_err = ""
     for fmt in fmts:
@@ -335,32 +327,42 @@ def load_whisper_once():
     return None
 
 def transcribe_slice_exact(whisper_model, media_path, tmp_wav, start_s=None, dur_s=None):
-    """Transcribes a short audio/video slice with word_timestamps=True starting cleanly at t=0.00s."""
+    """Extracts 0.000s-locked audio matching FFmpeg render seek and transcribes with razor-sharp word timestamps."""
     if whisper_model is None or not media_path or not os.path.exists(media_path):
         return []
     cmd = ["ffmpeg", "-y", "-hide_banner", "-loglevel", "error"]
     if start_s is not None:
-        cmd += ["-ss", f"{start_s:.2f}"]
+        cmd += ["-ss", f"{start_s:.3f}"]
     if dur_s is not None:
-        cmd += ["-t", f"{dur_s:.2f}"]
-    cmd += ["-i", os.path.abspath(media_path), "-vn", "-ac", "1", "-ar", "16000", "-c:a", "pcm_s16le", tmp_wav]
+        cmd += ["-t", f"{dur_s:.3f}"]
+    cmd += [
+        "-i", os.path.abspath(media_path),
+        "-vn", "-af", "asetpts=PTS-STARTPTS,aresample=async=1:first_pts=0",
+        "-ac", "1", "-ar", "16000", "-c:a", "pcm_s16le", tmp_wav
+    ]
     subprocess.run(cmd, capture_output=True, text=True)
     if not os.path.exists(tmp_wav) or os.path.getsize(tmp_wav) < 2048:
         return []
     try:
-        # vad_filter=False on short clips prevents dropping quiet words or loud laughs/screams!
-        segs, _ = whisper_model.transcribe(tmp_wav, beam_size=1, vad_filter=False, word_timestamps=True)
-        out = []
-        for s in segs:
-            txt = s.text.strip()
-            if not txt:
-                continue
-            words = [
-                {"start": round(float(w.start), 2), "end": round(float(w.end), 2), "word": w.word.strip()}
-                for w in (s.words or []) if w.word and w.word.strip()
-            ]
-            out.append({"start": round(float(s.start), 2), "end": round(float(s.end), 2), "text": txt, "words": words})
-        return out
+        # VAD with tight silence threshold + condition_on_previous_text=False eliminates slow/drifting captions!
+        for use_vad in (True, False):
+            kwargs = dict(beam_size=1, word_timestamps=True, condition_on_previous_text=False, vad_filter=use_vad)
+            if use_vad:
+                kwargs["vad_parameters"] = dict(min_silence_duration_ms=250, speech_pad_ms=80)
+            segs, _ = whisper_model.transcribe(tmp_wav, **kwargs)
+            out = []
+            for s in segs:
+                txt = s.text.strip()
+                if not txt:
+                    continue
+                words = [
+                    {"start": round(float(w.start), 3), "end": round(float(w.end), 3), "word": w.word.strip()}
+                    for w in (s.words or []) if w.word and w.word.strip()
+                ]
+                out.append({"start": round(float(s.start), 3), "end": round(float(s.end), 3), "text": txt, "words": words})
+            if out:
+                return out
+        return []
     except Exception as e:
         print(f"  -> Clip Whisper warning: {e}")
         return []
@@ -371,12 +373,11 @@ def transcribe_slice_exact(whisper_model, media_path, tmp_wav, start_s=None, dur
             pass
 
 def build_stratified_candidates(scout_segs, energy_scores, heatmap_scores, duration, num_clips, min_len, max_len):
-    """Picks balanced top hype windows across the ENTIRE 10+ hour stream (never clumping in Hour 1)."""
     hook_re = re.compile(r"\b(wait|what|why|how|no way|bro|crazy|insane|look|watch|secret|never|caught|mistake|truth|stop|listen|holy|check this|oh my|clip that|chat)\b", re.I)
     total_buckets = max(1, int(duration // 10) + 1)
-    target_pool = max(num_clips * 2, 70)
-    strata = max(4, min(20, int(duration // 1800) + 1))  # 1 stratum per ~30 min of stream
-    per_stratum = max(4, int(math.ceil(target_pool / strata)) + 1)
+    target_pool = max(num_clips * 4, 60)
+    strata = max(3, min(20, int(duration // 1800) + 1))
+    per_stratum = max(5, int(math.ceil(target_pool / strata)) + 2)
 
     seg_by_bucket = defaultdict(list)
     for s in scout_segs:
@@ -397,13 +398,11 @@ def build_stratified_candidates(scout_segs, energy_scores, heatmap_scores, durat
             txt = " ".join(s["text"] for s in segs_here)
             h_bonus = 30.0 if (txt and hook_re.search(txt)) else 0.0
             sc = heatmap_scores.get(b, 0.0) * 1.1 + energy_scores.get(b, 0.0) * 0.9 + h_bonus + min(15.0, len(txt.split()) * 0.5)
-            if sc <= 0.1 and not txt:
-                continue
             local_scored.append((sc, t_start))
         local_scored.sort(key=lambda x: x[0], reverse=True)
         chosen_here = []
         for sc, ts in local_scored:
-            if any(abs(ts - x[1]) < max_len * 0.9 for x in chosen_here):
+            if any(abs(ts - x[1]) < max(min_len, max_len * 0.75) for x in chosen_here):
                 continue
             chosen_here.append((sc, ts))
             if len(chosen_here) >= per_stratum:
@@ -411,7 +410,7 @@ def build_stratified_candidates(scout_segs, energy_scores, heatmap_scores, durat
         candidates.extend(chosen_here)
 
     candidates.sort(key=lambda x: x[1])
-    return candidates[: max(num_clips * 3, 120)]
+    return candidates[: max(num_clips * 5, 120)]
 
 def snap_hook_payoff(segments, start_s, end_s, min_len, max_len, duration):
     eff_min = min(float(min_len), max(5.0, float(duration) * 0.8))
@@ -428,19 +427,19 @@ def snap_hook_payoff(segments, start_s, end_s, min_len, max_len, duration):
 
     hook_re = re.compile(r"\b(wait|what|why|how|no way|bro|crazy|insane|look|watch|secret|never|caught|mistake|truth|stop|listen|holy|check this|oh my)\b", re.I)
     for s in reversed(segments):
-        if start - 6.0 <= s["start"] <= start + 3.0 and hook_re.search(s["text"]):
-            start = max(0.0, s["start"] - 0.6)
+        if start - 5.0 <= s["start"] <= start + 3.0 and hook_re.search(s["text"]):
+            start = max(0.0, s["start"] - 0.5)
             break
 
     best_end = min(float(duration), start + eff_max)
     sentence_ends = [
-        s["end"] + 0.5 for s in segments
+        s["end"] + 0.45 for s in segments
         if s["end"] >= start + eff_min and s["end"] - start <= eff_max and re.search(r"[.!?]$", s["text"].strip())
     ]
     if sentence_ends:
         best_end = min(float(duration), max(sentence_ends))
     else:
-        seg_ends = [s["end"] + 0.4 for s in segments if s["end"] >= start + eff_min and s["end"] - start <= eff_max]
+        seg_ends = [s["end"] + 0.35 for s in segments if s["end"] >= start + eff_min and s["end"] - start <= eff_max]
         if seg_ends:
             best_end = min(float(duration), max(seg_ends))
 
@@ -524,11 +523,22 @@ def _call_free_ai(prompt, provider, ollama_model):
                 print(f"  -> Ollama ({ollama_model}) skipped: {e}")
     return ""
 
+def _overlaps_any(st, en, picked, min_gap_ratio=0.55):
+    for p in picked:
+        inter = max(0.0, min(en, p["end"]) - max(st, p["start"]))
+        shortest = max(1.0, min(en - st, p["end"] - p["start"]))
+        if inter / shortest > (1.0 - min_gap_ratio):
+            return True
+    return False
+
 def select_clips_scalable(scout_segs, energy_scores, heatmap_scores, duration, num_clips, min_len, max_len, provider, ollama_model):
-    """Scales cleanly to 10+ hour VODs: pre-selects top stratified hype windows, then sends only 3-5 compact LLM batches."""
-    print(f"[2/5] Selecting up to {num_clips} hook-to-payoff clips ({min_len}s-{max_len}s) across {duration/3600:.2f}h stream...")
+    """Guarantees exact requested num_clips (whenever video duration physically fits them)."""
     eff_min = min(float(min_len), max(5.0, float(duration) * 0.8))
-    candidates = build_stratified_candidates(scout_segs, energy_scores, heatmap_scores, duration, num_clips, min_len, max_len)
+    max_possible = max(1, int(duration // max(eff_min * 0.85, 5.0)))
+    target_clips = min(num_clips, max_possible)
+    print(f"[2/5] Selecting {target_clips} hook-to-payoff clips ({min_len}s-{max_len}s) across {duration/60:.1f} min...")
+
+    candidates = build_stratified_candidates(scout_segs, energy_scores, heatmap_scores, duration, target_clips, min_len, max_len)
     picked = []
 
     has_llm = (
@@ -538,11 +548,11 @@ def select_clips_scalable(scout_segs, energy_scores, heatmap_scores, duration, n
         or (provider == "auto" and (os.environ.get("GROQ_API_KEY", "").strip() or os.environ.get("GEMINI_API_KEY", "").strip() or _ollama_is_alive()))
     )
 
-    # Batch candidate windows (25 windows per LLM call -> max 4-5 API calls even for a 12-hour stream!)
+    # Pass 1: AI selection on stratified hype windows
     if scout_segs and has_llm and candidates:
         batch_sz = 24
         n_batches = max(1, (len(candidates) + batch_sz - 1) // batch_sz)
-        per_batch = max(5, int(math.ceil(num_clips / n_batches)) + 3)
+        per_batch = max(5, int(math.ceil(target_clips / n_batches)) + 3)
         for b_idx in range(n_batches):
             batch = candidates[b_idx * batch_sz : (b_idx + 1) * batch_sz]
             blocks = []
@@ -559,43 +569,62 @@ def select_clips_scalable(scout_segs, energy_scores, heatmap_scores, duration, n
                 f"Rules:\n"
                 f"1. Start on a strong HOOK and hold through a complete PAYOFF/PUNCHLINE/REACTION.\n"
                 f"2. Duration MUST be between {int(eff_min)} and {max_len} seconds (strictly <= {max_len}s).\n"
-                f"3. Write a punchy viral title (max 7 words) and score viral potential 1-100.\n"
-                f"4. Return ONLY valid JSON: [{{\"start\": 1200, \"end\": 1245, \"score\": 94, \"title\": \"He Didn't Expect That\", \"reason\": \"Instant hook + chaos payoff\"}}].\n\n"
+                f"3. Write a punchy clickbait viral title (3-6 words) and score viral potential 1-100.\n"
+                f"4. Return ONLY valid JSON: [{{\"start\": 1200, \"end\": 1240, \"score\": 94, \"title\": \"HE DIDN'T EXPECT THIS\", \"reason\": \"Hook + payoff\"}}].\n\n"
                 + "\n".join(blocks)
             )
             raw = _call_free_ai(prompt, provider, ollama_model)
             for item in _parse_ai_json(raw):
                 st, en = snap_hook_payoff(scout_segs, item.get("start", 0), item.get("end", 0), min_len, max_len, duration)
-                if en - st >= eff_min and not any(abs(st - p["start"]) < max_len * 0.70 for p in picked):
+                if en - st >= eff_min and not _overlaps_any(st, en, picked, min_gap_ratio=0.65):
                     b = int(st // 10)
                     ai_sc = float(item.get("score", 85))
                     bonus = min(15.0, (heatmap_scores.get(b, 0.0) + energy_scores.get(b, 0.0)) * 0.15)
                     picked.append({
                         "start": st, "end": en, "duration": round(en - st, 1),
                         "score": round(min(100.0, ai_sc + bonus), 1),
-                        "title": str(item.get("title", "Wait For The Ending"))[:60],
-                        "reason": str(item.get("reason", "AI hook + payoff"))[:140],
+                        "title": str(item.get("title", "WAIT FOR THE END"))[:56],
+                        "reason": str(item.get("reason", "AI hook + payoff"))[:120],
                     })
 
-    # Top up from stratified hype candidates if needed
-    if len(picked) < num_clips:
-        ranked_cand = sorted(candidates, key=lambda x: x[0], reverse=True)
+    # Pass 2: Top-up from hype candidates (strict non-overlap first, then relaxed)
+    ranked_cand = sorted(candidates, key=lambda x: x[0], reverse=True)
+    for gap_ratio in (0.70, 0.45):
+        if len(picked) >= target_clips:
+            break
         for sc, ts in ranked_cand:
             st, en = snap_hook_payoff(scout_segs, ts, ts + max_len, min_len, max_len, duration)
-            if en - st < eff_min or any(abs(st - p["start"]) < max_len * 0.70 for p in picked):
+            if en - st < eff_min or _overlaps_any(st, en, picked, min_gap_ratio=gap_ratio):
                 continue
             win = [s["text"] for s in scout_segs if s["start"] >= st - 1 and s["start"] <= st + 8]
-            title = (win[0][:54] if win else f"Hype Moment At {int(st//60)}m{int(st%60):02d}s")
+            title = (win[0][:50] if win else f"INSANE MOMENT AT {int(st//60)}:{int(st%60):02d}")
             picked.append({
                 "start": st, "end": en, "duration": round(en - st, 1),
                 "score": round(min(98.0, 55.0 + min(43.0, sc * 0.45)), 1),
-                "title": title, "reason": f"Hype + replay/audio score {sc:.1f}",
+                "title": title, "reason": f"Hype score {sc:.1f}",
             })
-            if len(picked) >= num_clips:
+            if len(picked) >= target_clips:
                 break
 
+    # Pass 3: Guaranteed even-grid backfill so max_clips=5 NEVER returns only 3 clips!
+    if len(picked) < target_clips:
+        step = max(eff_min, (duration - eff_min) / max(1, target_clips + 1))
+        for k in range(1, target_clips * 3):
+            if len(picked) >= target_clips:
+                break
+            ts = min(max(0.0, duration - eff_min), k * (step * 0.65))
+            st, en = snap_hook_payoff(scout_segs, ts, ts + max_len, min_len, max_len, duration)
+            if en - st < eff_min or _overlaps_any(st, en, picked, min_gap_ratio=0.50):
+                continue
+            win = [s["text"] for s in scout_segs if s["start"] >= st - 1 and s["start"] <= st + 8]
+            title = (win[0][:50] if win else f"MUST WATCH AT {int(st//60)}:{int(st%60):02d}")
+            picked.append({
+                "start": st, "end": en, "duration": round(en - st, 1),
+                "score": 52.0, "title": title, "reason": "Even-coverage highlight",
+            })
+
     picked.sort(key=lambda x: x["score"], reverse=True)
-    picked = picked[:num_clips]
+    picked = picked[:target_clips]
     picked.sort(key=lambda x: x["start"])
     return picked
 
@@ -609,7 +638,7 @@ def _fmt_ass(sec):
 def _clean_text(txt):
     return re.sub(r"\s+", " ", (txt or "").replace("{", "(").replace("}", ")").replace("\\", "")).strip()
 
-def _wrap_banner(txt, max_line=24):
+def _wrap_banner(txt, max_line=22):
     words = _clean_text(txt).split()
     lines, cur = [], []
     for w in words:
@@ -647,13 +676,14 @@ def _style_params(style_name, font_family):
 
 def _layout_text_coords(layout, hook_style):
     if layout == "cam-top":
-        return (720 if hook_style == "mid-card" else 130), 1320
+        return (720 if hook_style == "mid-card" else 140), 1320
     if layout == "cam-bottom":
-        return (1200 if hook_style == "mid-card" else 140), 880
-    return (560 if hook_style == "mid-card" else 260), 1340
+        return (1200 if hook_style == "mid-card" else 140), 860
+    return (540 if hook_style == "mid-card" else 240), 1340
 
-def _extract_word_tokens(rel_segs, max_dur):
-    tokens = []
+def _extract_clean_word_tokens(rel_segs, max_dur):
+    """Extracts strictly monotonic, non-overlapping word tokens locked to 0.000s."""
+    raw = []
     for s in rel_segs:
         if s.get("words"):
             for w in s["words"]:
@@ -661,7 +691,7 @@ def _extract_word_tokens(rel_segs, max_dur):
                 we = min(max_dur, float(w["end"]))
                 wt = _clean_text(w["word"])
                 if wt and we > ws:
-                    tokens.append((ws, we, wt))
+                    raw.append([ws, we, wt])
         else:
             rs = max(0.0, float(s["start"]))
             re_ = min(max_dur, float(s["end"]))
@@ -669,11 +699,21 @@ def _extract_word_tokens(rel_segs, max_dur):
             if words and re_ > rs:
                 wd = (re_ - rs) / len(words)
                 for i, wt in enumerate(words):
-                    tokens.append((rs + i * wd, min(re_, rs + (i + 1) * wd), wt))
-    return tokens
+                    raw.append([rs + i * wd, min(re_, rs + (i + 1) * wd), wt])
+
+    raw.sort(key=lambda x: (x[0], x[1]))
+    clean = []
+    for ws, we, wt in raw:
+        if clean and ws < clean[-1][1]:
+            # Clamp previous word's end so two words NEVER overlap
+            clean[-1][1] = max(clean[-1][0] + 0.02, ws - 0.01)
+            ws = max(ws, clean[-1][1] + 0.005)
+        if we - ws >= 0.03:
+            clean.append([ws, we, wt])
+    return clean
 
 def build_styled_ass_relative(rel_segs, clip_dur, ass_path, caption_style, hook_style, hook_title, layout, font_family, seed_val=0):
-    """Builds ASS using 0.00s-relative clip timestamps so subtitles are ALWAYS frame-locked."""
+    """Zero-overlap, tight-sync ASS builder."""
     if caption_style == "none" and hook_style == "none":
         return None, 0
     chosen = caption_style
@@ -702,16 +742,18 @@ def build_styled_ass_relative(rel_segs, clip_dur, ass_path, caption_style, hook_
         f"{hook_line}\n\n"
         "[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n"
     )
+
     events = []
     if hook_style != "none" and hook_title:
-        banner = _wrap_banner(hook_title if hook_style == "mid-card" else hook_title.upper(), 26)
+        banner = _wrap_banner(hook_title if hook_style == "mid-card" else hook_title.upper(), 24)
         if banner:
-            hook_end = _fmt_ass(min(clip_dur, 5.0 if hook_style == "mid-card" else 3.8))
-            events.append(f"Dialogue: 2,0:00:00.10,{hook_end},HookBanner,,0,0,0,,{{\\an5\\pos(540,{hook_y})}}{banner}")
+            hook_end = _fmt_ass(min(clip_dur, 4.2 if hook_style == "mid-card" else 3.2))
+            events.append(f"Dialogue: 2,0:00:00.08,{hook_end},HookBanner,,0,0,0,,{{\\an5\\pos(540,{hook_y})}}{banner}")
 
+    sub_rows = []  # (start, end, text)
     word_count = 0
     if chosen != "none" and rel_segs:
-        tokens = _extract_word_tokens(rel_segs, clip_dur)
+        tokens = _extract_clean_word_tokens(rel_segs, clip_dur)
         word_count = len(tokens)
         for i in range(0, len(tokens), step):
             group = tokens[i : i + step]
@@ -719,10 +761,9 @@ def build_styled_ass_relative(rel_segs, clip_dur, ass_path, caption_style, hook_
                 continue
             if mode == "active" and len(group) > 1:
                 for active_idx, (ws, we, _) in enumerate(group):
-                    nxt = group[active_idx + 1][0] if active_idx + 1 < len(group) else we
-                    seg_end = max(we, min(nxt, ws + 1.5))
-                    if seg_end - ws < 0.04:
-                        continue
+                    nxt_start = group[active_idx + 1][0] if active_idx + 1 < len(group) else we
+                    # Tight end: hold up to next word in same group (max 0.35s pause), NEVER past next word!
+                    ev_end = min(nxt_start, we + 0.25) if active_idx + 1 < len(group) else we
                     parts = []
                     for j, (_, _, wt) in enumerate(group):
                         word_up = wt.upper() if chosen != "minimal-clean" else wt
@@ -731,13 +772,21 @@ def build_styled_ass_relative(rel_segs, clip_dur, ass_path, caption_style, hook_
                     if chosen == "two-line-stack" and len(parts) >= 4:
                         mid = len(parts) // 2
                         line = " ".join(parts[:mid]) + "\\N" + " ".join(parts[mid:])
-                    events.append(f"Dialogue: 1,{_fmt_ass(ws)},{_fmt_ass(seg_end)},Default,,0,0,0,,{{\\an5\\pos(540,{sub_y})}}{line}")
+                    sub_rows.append([ws, ev_end, line])
             else:
                 gs, ge = group[0][0], group[-1][1]
-                if ge - gs < 0.06:
-                    continue
                 text_out = " ".join(w[2].upper() if chosen != "minimal-clean" else w[2] for w in group)
-                events.append(f"Dialogue: 1,{_fmt_ass(gs)},{_fmt_ass(ge)},Default,,0,0,0,,{{\\an5\\pos(540,{sub_y})}}{text_out}")
+                sub_rows.append([gs, ge, text_out])
+
+    # FINAL HARD GUARD: guarantee strictly non-overlapping captions across the entire clip!
+    sub_rows.sort(key=lambda x: x[0])
+    for idx_r in range(len(sub_rows)):
+        s0, e0, txt = sub_rows[idx_r]
+        if idx_r + 1 < len(sub_rows):
+            nxt_s = sub_rows[idx_r + 1][0]
+            e0 = min(e0, nxt_s - 0.015)
+        if e0 - s0 >= 0.04:
+            events.append(f"Dialogue: 1,{_fmt_ass(s0)},{_fmt_ass(e0)},Default,,0,0,0,,{{\\an5\\pos(540,{sub_y})}}{txt}")
 
     if not events:
         return None, 0
@@ -806,13 +855,12 @@ def _build_video_filter(layout, cam_pos, cam_w, cam_h, cam_x, cam_y, ass_filenam
     return f"{base};[vbase]null[vout]"
 
 def run_instant_preview(url, cookies, min_height, tmp_dir, out_dir, layout, cam_pos, cam_w, cam_h, cam_x, cam_y, caption_style, hook_style, font_family, preview_sec):
-    """Downloads ONLY 4 seconds on YouTube URLs (works in ~8s even on a 12-hour stream!) and renders calibration images."""
     if os.path.isfile(url):
         prev_src = os.path.abspath(url)
         seek_in = max(1.0, float(preview_sec))
     else:
         prev_mp4 = os.path.join(tmp_dir, f"prev_{int(preview_sec)}.mp4")
-        print(f"Downloading 4-second preview slice at {int(preview_sec)}s (zero full-stream download)...")
+        print(f"Downloading 4-second preview slice at {int(preview_sec)}s...")
         prev_src, err = download_surgical_section(url, preview_sec, preview_sec + 4.0, prev_mp4, cookies, min_height)
         if not prev_src:
             raise RuntimeError(f"Preview slice download failed: {err}")
@@ -839,7 +887,7 @@ def run_instant_preview(url, cookies, min_height, tmp_dir, out_dir, layout, cam_
         ]
     }]
     ass_path = os.path.join(tmp_dir, "preview_sub.ass")
-    ass_name, _ = build_styled_ass_relative(sample_segs, 3.0, ass_path, caption_style, hook_style, "He Didn't Expect This Moment", layout, font_family)
+    ass_name, _ = build_styled_ass_relative(sample_segs, 3.0, ass_path, caption_style, hook_style, "HE DIDN'T EXPECT THIS", layout, font_family)
     vfilter = _build_video_filter(layout, cam_pos, cam_w, cam_h, cam_x, cam_y, ass_name)
     fc_file = os.path.join(tmp_dir, "preview_fc.txt")
     with open(fc_file, "w", encoding="utf-8") as f:
@@ -886,20 +934,20 @@ def _render_worker(args_tuple):
 
     inputs = []
     if seek_s is not None:
-        inputs += ["-ss", f"{seek_s:.2f}"]
-    inputs += ["-t", f"{render_dur:.2f}", "-i", os.path.abspath(clip_src_mp4)]
+        inputs += ["-ss", f"{seek_s:.3f}"]
+    inputs += ["-t", f"{render_dur:.3f}", "-i", os.path.abspath(clip_src_mp4)]
 
     if has_audio and sfx_path and os.path.exists(sfx_path):
         inputs += ["-i", os.path.abspath(sfx_path)]
         fc = (
             f"{vfilter};\n"
             "[1:a]adelay=100|100,volume=0.45[sfx];\n"
-            "[0:a]asetpts=PTS-STARTPTS,aformat=sample_rates=44100:channel_layouts=stereo[main_a];\n"
+            "[0:a]asetpts=PTS-STARTPTS,aresample=async=1:first_pts=0,aformat=sample_rates=44100:channel_layouts=stereo[main_a];\n"
             "[main_a][sfx]amix=inputs=2:duration=first:dropout_transition=0:normalize=0[aout]"
         )
         maps = ["-map", "[vout]", "-map", "[aout]"]
     else:
-        fc = f"{vfilter};\n[0:a]asetpts=PTS-STARTPTS[aout]" if has_audio else vfilter
+        fc = f"{vfilter};\n[0:a]asetpts=PTS-STARTPTS,aresample=async=1:first_pts=0[aout]" if has_audio else vfilter
         maps = ["-map", "[vout]", "-map", "[aout]"] if has_audio else ["-map", "[vout]"]
 
     fc_file = os.path.join(tmp_dir, f"fc_{idx:03d}.txt")
@@ -929,8 +977,96 @@ def _render_worker(args_tuple):
         return idx, fname, time.time() - t0, wcount, None
     return idx, "FAILED", time.time() - t0, wcount, (r.stderr or "").strip()[-350:]
 
-def build_top_10_viral(session_dir, rows):
-    print("[5/5] Building clean top_10_viral/ folder + 1080x1920 thumbnails...")
+def _score_frame_clickbait(mp4_path, ts):
+    """Scores a single frame by sharpness + contrast + brightness (rejects blurry or dark frames)."""
+    cmd = [
+        "ffmpeg", "-hide_banner", "-loglevel", "error",
+        "-ss", f"{ts:.2f}", "-i", mp4_path,
+        "-vf", "scale=180:320", "-vframes", "1", "-f", "rawvideo", "-pix_fmt", "rgb24", "pipe:1"
+    ]
+    r = subprocess.run(cmd, capture_output=True)
+    if r.returncode != 0 or len(r.stdout) < 180 * 320 * 3:
+        return -1.0
+    arr = np.frombuffer(r.stdout[: 180 * 320 * 3], dtype=np.uint8).reshape((320, 180, 3)).astype(np.float32)
+    gray = 0.299 * arr[:, :, 0] + 0.587 * arr[:, :, 1] + 0.114 * arr[:, :, 2]
+    # Edge sharpness (gradient magnitude) + contrast + color vibrancy
+    gx = np.abs(np.diff(gray, axis=1)).mean()
+    gy = np.abs(np.diff(gray, axis=0)).mean()
+    sharpness = float(gx + gy)
+    contrast = float(gray.std())
+    mean_luma = float(gray.mean())
+    saturation = float(arr.std(axis=2).mean())
+    # Penalize very dark or blown-out frames
+    luma_penalty = 0.45 if (mean_luma < 35.0 or mean_luma > 225.0) else 1.0
+    return (sharpness * 2.2 + contrast * 1.1 + saturation * 0.9) * luma_penalty
+
+def _find_clickbait_timestamp(mp4_path, dur):
+    """Finds the peak reaction/action climax inside the trimmed Short (skipping intro SFX & outro) and picks the sharpest frame."""
+    dur = max(4.0, float(dur))
+    lo = min(2.2, dur * 0.15)
+    hi = max(lo + 1.5, dur - 1.5)
+
+    # 1. Scan 0.5s audio peaks inside the Short to locate the core reaction/payoff climax
+    peaks = stream_audio_peaks_zero_disk(mp4_path, cache_json=None, bucket_sec=0.5)
+    cand_times = []
+    if peaks:
+        valid_b = [(sc, b * 0.5 + 0.25) for b, sc in peaks.items() if lo <= (b * 0.5 + 0.25) <= hi]
+        valid_b.sort(key=lambda x: x[0], reverse=True)
+        for _, t_pk in valid_b[:6]:
+            if all(abs(t_pk - existing) >= 1.2 for existing in cand_times):
+                cand_times.append(t_pk)
+                if len(cand_times) >= 4:
+                    break
+
+    # Always include midpoint + golden-ratio core frames as visual candidates
+    for frac in (0.38, 0.55, 0.72):
+        t_f = lo + (hi - lo) * frac
+        if all(abs(t_f - x) >= 1.0 for x in cand_times):
+            cand_times.append(t_f)
+
+    # 2. Pick the visually sharpest, highest-contrast, most vibrant frame among the climax candidates
+    best_t, best_sc = cand_times[0] if cand_times else dur * 0.5, -1.0
+    for t_c in cand_times[:7]:
+        sc = _score_frame_clickbait(mp4_path, t_c)
+        if sc > best_sc:
+            best_sc, best_t = sc, t_c
+    return best_t
+
+def _render_clickbait_thumbnail(mp4_path, thumb_jpg, title, dur, tmp_dir, font_family):
+    """Extracts the core climax frame, boosts color/sharpness, and burns a punchy clickbait headline."""
+    peak_t = _find_clickbait_timestamp(mp4_path, dur)
+    words = _clean_text(title).upper().split()[:5]
+    headline = _wrap_banner(" ".join(words) if words else "WAIT FOR IT", max_line=15)
+
+    ass_file = os.path.join(tmp_dir, "thumb_title.ass")
+    ass_text = (
+        "[Script Info]\nScriptType: v4.00+\nPlayResX: 1080\nPlayResY: 1920\nScaledBorderAndShadow: yes\n\n"
+        "[V4+ Styles]\nFormat: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, "
+        "Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, "
+        "Alignment, MarginL, MarginR, MarginV, Encoding\n"
+        f"Style: Clickbait,{font_family},92,&H0000FFFF,&H000000FF,&H00000000,&HC0000000,-1,0,0,0,100,100,0,0,1,10,5,5,50,50,0,1\n\n"
+        "[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n"
+        f"Dialogue: 1,0:00:00.00,0:00:10.00,Clickbait,,0,0,0,,{{\\an5\\pos(540,420)}}{headline}\n"
+    )
+    with open(ass_file, "w", encoding="utf-8") as f:
+        f.write(ass_text)
+
+    vf = "setpts=PTS-STARTPTS,eq=contrast=1.16:saturation=1.32:brightness=0.03,unsharp=5:5:1.1,ass=thumb_title.ass:fontsdir=fonts"
+    r = subprocess.run(
+        ["ffmpeg", "-y", "-hide_banner", "-loglevel", "error", "-ss", f"{peak_t:.2f}", "-i", os.path.abspath(mp4_path),
+         "-vf", vf, "-vframes", "1", "-q:v", "2", os.path.abspath(thumb_jpg)],
+        cwd=tmp_dir, capture_output=True, text=True
+    )
+    if r.returncode != 0 or not os.path.exists(thumb_jpg):
+        subprocess.run(
+            ["ffmpeg", "-y", "-hide_banner", "-loglevel", "error", "-ss", f"{peak_t:.2f}", "-i", os.path.abspath(mp4_path),
+             "-vframes", "1", "-q:v", "2", os.path.abspath(thumb_jpg)],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+        )
+    return peak_t
+
+def build_top_10_viral(session_dir, rows, tmp_dir, font_family):
+    print("[5/5] Building top_10_viral/ folder + 100% clickbait core-moment thumbnails...")
     top_dir = os.path.join(session_dir, "top_10_viral")
     shorts_dir = os.path.join(session_dir, "shorts")
     if os.path.exists(top_dir):
@@ -940,55 +1076,18 @@ def build_top_10_viral(session_dir, rows):
     valid = [r for r in rows if r["file"] != "FAILED" and os.path.exists(os.path.join(shorts_dir, r["file"]))]
     ranked = sorted(valid, key=lambda x: x.get("score", 0), reverse=True)[:10]
 
-    top_meta = []
     for rank, r in enumerate(ranked, 1):
         src_mp4 = os.path.join(shorts_dir, r["file"])
-        dst_name = f"rank_{rank:02d}_{r['file']}"
-        thumb_name = f"rank_{rank:02d}_{os.path.splitext(r['file'])[0]}_thumb.jpg"
-        dst_mp4 = os.path.join(top_dir, dst_name)
-        thumb_jpg = os.path.join(top_dir, thumb_name)
+        dst_mp4 = os.path.join(top_dir, f"rank_{rank:02d}_{r['file']}")
+        thumb_jpg = os.path.join(top_dir, f"rank_{rank:02d}_{os.path.splitext(r['file'])[0]}_thumb.jpg")
         shutil.copy2(src_mp4, dst_mp4)
-        snap_t = min(1.6, max(0.4, float(r.get("duration", 10)) * 0.15))
-        subprocess.run(
-            ["ffmpeg", "-y", "-hide_banner", "-loglevel", "error", "-ss", f"{snap_t:.2f}", "-i", dst_mp4, "-vframes", "1", "-q:v", "2", thumb_jpg],
-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
-        )
-        top_meta.append({**r, "rank": rank, "top_file": dst_name, "thumb": thumb_name})
-    print(f"  -> Saved {len(top_meta)} top viral clips + thumbnails in {top_dir}")
-    return top_meta
-
-def write_reports(session_dir, title, url, rows, top_meta):
-    trans_dir = os.path.join(session_dir, "transcript")
-    rep_dir = os.path.join(session_dir, "report")
-    os.makedirs(trans_dir, exist_ok=True)
-    os.makedirs(rep_dir, exist_ok=True)
-
-    with open(os.path.join(trans_dir, "clips.json"), "w", encoding="utf-8") as f:
-        json.dump(rows, f, indent=2)
-    with open(os.path.join(trans_dir, "clips.csv"), "w", newline="", encoding="utf-8") as f:
-        w = csv.DictWriter(f, fieldnames=["clip", "score", "start", "end", "duration", "words", "title", "reason", "file"])
-        w.writeheader()
-        w.writerows(rows)
-
-    cards = "\n".join(
-        f"<div class='card'><img src='../top_10_viral/{t['thumb']}'/><div><b>#{t['rank']} (Score {t['score']})</b><br>{t['title']}<br><small>{t['duration']}s | {t['top_file']}</small></div></div>"
-        for t in top_meta
-    )
-    trs = "\n".join(
-        f"<tr><td>{r['clip']}</td><td><b>{r['score']}</b></td><td>{r['start']}s - {r['end']}s</td><td>{r['duration']}s</td><td>{r['words']}</td><td>{r['title']}</td><td>{r['reason']}</td><td>{r['file']}</td></tr>"
-        for r in rows
-    )
-    html = (
-        f"<!doctype html><html><head><meta charset='utf-8'><title>HypeClipper v7 - {title}</title>"
-        f"<style>body{{font-family:sans-serif;background:#0f1115;color:#eee;padding:24px}}.grid{{display:grid;grid-template-columns:repeat(auto-fill,minmax(180px,1fr));gap:14px;margin-bottom:28px}}.card{{background:#171b24;border:1px solid #2b303c;border-radius:8px;overflow:hidden;padding:8px}}.card img{{width:100%;border-radius:6px;margin-bottom:6px}}table{{width:100%;border-collapse:collapse}}th,td{{border:1px solid #2b303c;padding:8px;text-align:left}}th{{background:#1b202b}}</style></head>"
-        f"<body><h1>HypeClipper v7 Report: {title}</h1><p>Source: {url}</p><h2>Top 10 Viral Picks</h2><div class='grid'>{cards}</div><h2>All Clips</h2><table><thead><tr><th>#</th><th>Score</th><th>Range</th><th>Duration</th><th>Sub Words</th><th>Hook/Title</th><th>Payoff Reason</th><th>File</th></tr></thead><tbody>{trs}</tbody></table></body></html>"
-    )
-    with open(os.path.join(rep_dir, "index.html"), "w", encoding="utf-8") as f:
-        f.write(html)
+        pk = _render_clickbait_thumbnail(dst_mp4, thumb_jpg, r["title"], r.get("duration", 30.0), tmp_dir, font_family)
+        print(f"  -> Top #{rank:02d}: {os.path.basename(dst_mp4)} | clickbait thumb @ {pk:.1f}s")
+    print(f"  -> Saved {len(ranked)} top viral clips + clickbait thumbnails in {top_dir}")
 
 def main():
     t0 = time.time()
-    parser = argparse.ArgumentParser(description="HypeClipper v7: 10+ Hour VOD Scalable Shorts Engine")
+    parser = argparse.ArgumentParser(description="HypeClipper v8: Exact Clip Count, Zero-Overlap Synced Subtitles, Clickbait Thumbnails")
     parser.add_argument("url")
     parser.add_argument("--clips", type=int, default=40)
     parser.add_argument("--min-len", type=int, default=25)
@@ -1025,7 +1124,7 @@ def main():
     use_surgical = (not is_local) and (args.fetch_mode == "surgical" or (args.fetch_mode == "auto" and duration >= 2700.0))
 
     src_sid = hashlib.md5(f"{args.url}|{min_height}".encode()).hexdigest()[:10]
-    run_sid = hashlib.md5(f"{args.url}|{min_len}|{max_len}|{min_height}|{args.layout}|{args.cam_pos}|{args.cam_w}|{args.cam_h}|{args.cam_x}|{args.cam_y}|{args.caption_style}|{args.hook_style}|{args.sfx}".encode()).hexdigest()[:10]
+    run_sid = hashlib.md5(f"{args.url}|{args.clips}|{min_len}|{max_len}|{min_height}|{args.layout}|{args.cam_pos}|{args.cam_w}|{args.cam_h}|{args.cam_x}|{args.cam_y}|{args.caption_style}|{args.hook_style}|{args.sfx}".encode()).hexdigest()[:10]
 
     shared_cache = os.path.abspath(os.path.join(args.work_dir, f"src_{src_sid}"))
     local_work = os.path.abspath(os.path.join(args.work_dir, f"run_{run_sid}"))
@@ -1058,17 +1157,17 @@ def main():
     energy_scores = defaultdict(float)
     full_src_mp4 = None
 
-    # Resume checkpoint: reuse selected_clips.json from Google Drive if Colab reconnected!
     sel_cache = os.path.join(final_session_dir, "selected_clips.json")
+    selected = []
     if os.path.exists(sel_cache):
         try:
             with open(sel_cache, "r", encoding="utf-8") as f:
-                selected = json.load(f)
-            print(f"[2/5] Resuming checkpoint: loaded {len(selected)} previously selected clips from Drive.")
+                cached_sel = json.load(f)
+            if len(cached_sel) >= args.clips:
+                selected = cached_sel[: args.clips]
+                print(f"[2/5] Resuming checkpoint: loaded {len(selected)} clips from Drive.")
         except Exception:
             selected = []
-    else:
-        selected = []
 
     if not use_surgical:
         full_src_mp4 = download_source_1080p(args.url, os.path.join(shared_cache, "source_1080p.mp4"), args.cookies, min_height)
@@ -1078,17 +1177,15 @@ def main():
         if not is_local:
             scout_segs = fetch_youtube_captions(args.url, shared_cache, args.cookies)
 
-        # If YouTube has no captions OR it's a local file, run zero-disk audio energy scan
         if not scout_segs or not heatmap_scores:
             scan_media = full_src_mp4 if full_src_mp4 else download_audio_only(args.url, os.path.join(shared_cache, "scout_audio.m4a"), args.cookies)
             if scan_media:
                 energy_scores = stream_audio_peaks_zero_disk(scan_media, os.path.join(shared_cache, "audio_energy.json"))
-                # If no YouTube captions exist (e.g. local 10h file), transcribe ONLY top ~60 audio-peak windows!
                 if not scout_segs:
                     wm_scout = load_whisper_once()
                     if wm_scout:
-                        top_cands = build_stratified_candidates([], energy_scores, heatmap_scores, duration, max(args.clips, 35), min_len, max_len)[:65]
-                        print(f"  -> No captions found; fast-transcribing {len(top_cands)} top hype windows instead of full {duration/3600:.1f}h...")
+                        top_cands = build_stratified_candidates([], energy_scores, heatmap_scores, duration, max(args.clips, 20), min_len, max_len)[: max(args.clips * 2, 40)]
+                        print(f"  -> No captions found; fast-transcribing {len(top_cands)} top hype windows...")
                         for c_idx, (_, ts) in enumerate(top_cands, 1):
                             sl_segs = transcribe_slice_exact(wm_scout, scan_media, os.path.join(shared_cache, f"sc_{c_idx}.wav"), start_s=ts, dur_s=max_len + 6.0)
                             for s in sl_segs:
@@ -1102,8 +1199,7 @@ def main():
 
     sfx_path = generate_hook_sfx(os.path.join(shared_cache, "hook_sfx.wav")) if args.sfx else None
 
-    # Stage 3: Fetch surgical 1080p mini-clips (if surgical mode) & run EXACT clip-level word-sync Whisper!
-    print(f"[3/5] Preparing {len(selected)} clips + exact 0.00s word-synced subtitles...")
+    print(f"[3/5] Preparing {len(selected)} clips + tight-sync 0.00s word subtitles...")
     clip_inputs = {}
     if use_surgical:
         def _dl_one(item):
@@ -1118,7 +1214,7 @@ def main():
         with ThreadPoolExecutor(max_workers=4) as dl_pool:
             for i, path, err, already_done in dl_pool.map(_dl_one, enumerate(selected, 1)):
                 if already_done:
-                    clip_inputs[i] = ("DONE", None, None)
+                    clip_inputs[i] = ("DONE", None, None, True)
                 elif path:
                     cdur, haud, _, _ = probe_video_info(path)
                     clip_inputs[i] = (path, None, min(max_len, max(5.0, cdur or selected[i - 1]["duration"])), haud)
@@ -1130,11 +1226,10 @@ def main():
         for i, c in enumerate(selected, 1):
             final_mp4 = os.path.join(final_shorts_dir, f"short_{i:03d}.mp4")
             if os.path.exists(final_mp4) and os.path.getsize(final_mp4) > 10240:
-                clip_inputs[i] = ("DONE", None, None)
+                clip_inputs[i] = ("DONE", None, None, True)
             else:
                 clip_inputs[i] = (full_src_mp4, c["start"], max(5.0, c["end"] - c["start"]), haud)
 
-    # Load Whisper ONCE and generate 100% locked 0.00s word timestamps for every unrendered clip
     need_subs = (args.caption_style != "none")
     whisper_model = load_whisper_once() if need_subs else None
     tasks = []
@@ -1145,13 +1240,13 @@ def main():
         if not info or info[0] is None:
             skipped_rows[i] = {
                 "clip": i, "score": c.get("score", 0), "start": c["start"], "end": c["end"],
-                "duration": c["duration"], "words": 0, "title": c["title"], "reason": "Download failed", "file": "FAILED"
+                "duration": c["duration"], "words": 0, "title": c["title"], "file": "FAILED"
             }
             continue
         if info[0] == "DONE":
             skipped_rows[i] = {
                 "clip": i, "score": c.get("score", 0), "start": c["start"], "end": c["end"],
-                "duration": c["duration"], "words": -1, "title": c["title"], "reason": c["reason"], "file": f"short_{i:03d}.mp4"
+                "duration": c["duration"], "words": -1, "title": c["title"], "file": f"short_{i:03d}.mp4"
             }
             continue
 
@@ -1170,7 +1265,6 @@ def main():
                 if rel_segs:
                     with open(sub_cache, "w", encoding="utf-8") as f:
                         json.dump(rel_segs, f)
-            # Fallback to YouTube scout captions shifted to 0.00s if Whisper wasn't available
             if not rel_segs and scout_segs:
                 rel_segs = [
                     {"start": max(0.0, s["start"] - c["start"]), "end": min(rdur, s["end"] - c["start"]), "text": s["text"]}
@@ -1184,12 +1278,12 @@ def main():
             sfx_path, haud, font_family
         ))
 
-    del whisper_model  # Free VRAM before parallel NVENC rendering!
+    del whisper_model
 
     enc_name, enc_args = detect_fast_1080p_encoder()
     workers = 3 if enc_name == "h264_nvenc" else max(1, min(args.workers, os.cpu_count() or 4))
     tasks = [t[:8] + (enc_name, enc_args) + t[10:] for t in tasks]
-    print(f"[4/5] Rendering {len(tasks)} Shorts ({len(skipped_rows)} cached/skipped, {workers} workers, {enc_name}, layout={args.layout})...")
+    print(f"[4/5] Rendering {len(tasks)} Shorts ({len(skipped_rows)} cached, {workers} workers, {enc_name}, layout={args.layout})...")
 
     results_map = dict(skipped_rows)
     if tasks:
@@ -1200,7 +1294,7 @@ def main():
                 idx, fname, elapsed, wcount, err = fut.result()
                 results_map[idx] = {
                     "clip": idx, "score": c.get("score", 0), "start": c["start"], "end": c["end"],
-                    "duration": c["duration"], "words": wcount, "title": c["title"], "reason": c["reason"], "file": fname
+                    "duration": c["duration"], "words": wcount, "title": c["title"], "file": fname
                 }
                 if err:
                     print(f"  [{idx}/{len(selected)}] FAILED ({elapsed:.1f}s): {err}")
@@ -1208,8 +1302,7 @@ def main():
                     print(f"  [{idx}/{len(selected)}] Score {c.get('score',0)} | words={wcount} | {c['start']}s->{c['end']}s ({c['duration']}s) in {elapsed:.1f}s | {c['title']}")
 
     rows = [results_map[i] for i in sorted(results_map.keys())]
-    top_meta = build_top_10_viral(final_session_dir, rows)
-    write_reports(final_session_dir, title, args.url, rows, top_meta)
+    build_top_10_viral(final_session_dir, rows, local_work, font_family)
     print(f"\nDONE in {time.time() - t0:.1f}s total! Output: {final_session_dir}")
 
 if __name__ == "__main__":
