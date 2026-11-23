@@ -505,7 +505,9 @@ def transcribe_stage1_exact(whisper_model, stage1_mp4, tmp_wav):
             kwargs = dict(beam_size=1, word_timestamps=True, condition_on_previous_text=False, vad_filter=use_vad)
             if use_vad:
                 kwargs["vad_parameters"] = dict(min_silence_duration_ms=250, speech_pad_ms=80)
-            segs, _ = whisper_model.transcribe(tmp_wav, **kwargs)
+            with wave.open(tmp_wav, "rb") as _wf:
+                _audio_np = np.frombuffer(_wf.readframes(_wf.getnframes()), dtype=np.int16).astype(np.float32) / 32768.0
+            segs, _ = whisper_model.transcribe(_audio_np, **kwargs)
             out = []
             for s in segs:
                 txt = s.text.strip()
