@@ -965,33 +965,33 @@ def _build_layout_filter(layout, cam_pos, cam_w, cam_h, cam_x, cam_y):
     cam_crop = f"crop=iw*{cw:.3f}:ih*{ch:.3f}:iw*{rx:.3f}:ih*{ry:.3f}"
 
     if layout == "crop-focus":
-        return f"{src_chain};[vsrc]scale=1080:1920:force_original_aspect_ratio=increase:flags=lanczos,crop=1080:1920[vout]"
+        return f"{src_chain};[vsrc]scale=1080:1920:force_original_aspect_ratio=increase:flags=bilinear,crop=1080:1920[vout]"
     if layout == "cam-top":
         return (
             f"{src_chain};[vsrc]split[cam][game];"
-            f"[cam]{cam_crop},scale=1080:720:force_original_aspect_ratio=increase:flags=lanczos,crop=1080:720[top];"
-            "[game]scale=1080:1200:force_original_aspect_ratio=increase:flags=lanczos,crop=1080:1200[bot];"
+            f"[cam]{cam_crop},scale=1080:720:force_original_aspect_ratio=increase:flags=bilinear,crop=1080:720[top];"
+            "[game]scale=1080:1200:force_original_aspect_ratio=increase:flags=bilinear,crop=1080:1200[bot];"
             "[top][bot]vstack[vout]"
         )
     if layout == "cam-bottom":
         return (
             f"{src_chain};[vsrc]split[game][cam];"
-            "[game]scale=1080:1200:force_original_aspect_ratio=increase:flags=lanczos,crop=1080:1200[top];"
-            f"[cam]{cam_crop},scale=1080:720:force_original_aspect_ratio=increase:flags=lanczos,crop=1080:720[bot];"
+            "[game]scale=1080:1200:force_original_aspect_ratio=increase:flags=bilinear,crop=1080:1200[top];"
+            f"[cam]{cam_crop},scale=1080:720:force_original_aspect_ratio=increase:flags=bilinear,crop=1080:720[bot];"
             "[top][bot]vstack[vout]"
         )
     if layout in ("pip-top-right", "pip-top-left"):
         ox = "W-w-36" if layout == "pip-top-right" else "36"
         return (
             f"{src_chain};[vsrc]split[cam][game];"
-            "[game]scale=1080:1920:force_original_aspect_ratio=increase:flags=lanczos,crop=1080:1920[bg];"
-            f"[cam]{cam_crop},scale=360:360:force_original_aspect_ratio=increase:flags=lanczos,crop=360:360,pad=372:372:6:6:white[pip];"
+            "[game]scale=1080:1920:force_original_aspect_ratio=increase:flags=bilinear,crop=1080:1920[bg];"
+            f"[cam]{cam_crop},scale=360:360:force_original_aspect_ratio=increase:flags=bilinear,crop=360:360,pad=372:372:6:6:white[pip];"
             f"[bg][pip]overlay={ox}:90[vout]"
         )
     return (
         f"{src_chain};[vsrc]split[orig][bg];"
         "[bg]scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,boxblur=18:2,eq=brightness=-0.22[bgd];"
-        "[orig]scale=1080:1920:force_original_aspect_ratio=decrease:flags=lanczos[fg];"
+        "[orig]scale=1080:1920:force_original_aspect_ratio=decrease:flags=bilinear[fg];"
         "[bgd][fg]overlay=(W-w)/2:(H-h)/2[vout]"
     )
 
@@ -1094,7 +1094,7 @@ def _stage1_trim_worker(args_tuple):
             "-c:a", "aac", "-b:a", "192k",
             out_stage1
         ]
-        return subprocess.run(cmd, cwd=tmp_dir, capture_output=True, text=True, timeout=180)
+        return subprocess.run(cmd, cwd=tmp_dir, capture_output=True, text=True, timeout=420)
 
     try:
         r = _run(enc_name, enc_args)
@@ -1178,7 +1178,7 @@ def _stage3_finish_worker(args_tuple):
             "-movflags", "+faststart",
             out_local
         ]
-        return subprocess.run(cmd, cwd=tmp_dir, capture_output=True, text=True, timeout=180)
+        return subprocess.run(cmd, cwd=tmp_dir, capture_output=True, text=True, timeout=420)
 
     try:
         r = _run(enc_name, enc_args)
@@ -1406,7 +1406,7 @@ def main():
 
     sfx_pack = generate_sfx_pack(os.path.join(shared_cache, "sfx_pack")) if args.sfx else None
     enc_name, enc_args = detect_fast_1080p_encoder()
-    workers = 3 if enc_name == "h264_nvenc" else max(1, min(args.workers, os.cpu_count() or 4))
+    workers = 2 if enc_name == "h264_nvenc" else max(1, min(args.workers, os.cpu_count() or 4))
 
     # --- STAGE 1: Fetch HD clips & encode 0.000s-locked 1080x1920 intermediates ---
     log(f"[3/5] Stage 1: Fetching HD + locking {len(selected)} clips to 0.000s ({workers} workers, {enc_name})...")
@@ -1533,3 +1533,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
