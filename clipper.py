@@ -29,6 +29,9 @@ GEMINI_FREE_MODELS = [
     "gemini-2.5-flash",
 ]
 
+def log(msg):
+    print(msg, flush=True)
+
 def py_cmd():
     return "py" if os.name == "nt" else "python3"
 
@@ -62,7 +65,7 @@ def prepare_local_fonts(tmp_dir):
 def probe_video_info(video_path):
     res = subprocess.run(
         ["ffprobe", "-v", "error", "-show_entries", "format=duration:stream=codec_type,width,height", "-of", "json", video_path],
-        capture_output=True, text=True
+        capture_output=True, text=True, timeout=30
     )
     dur, has_audio, w, h = 0.0, True, 0, 0
     if res.returncode == 0 and res.stdout.strip():
@@ -84,13 +87,13 @@ def get_metadata(url, cookies=None):
     if os.path.isfile(url):
         dur, _, _, _ = probe_video_info(url)
         return {"title": os.path.splitext(os.path.basename(url))[0], "duration": dur or 3600.0, "heatmap": []}
-    cmd = [py_cmd(), "-m", "yt_dlp", "--dump-single-json", "--skip-download"]
+    cmd = [py_cmd(), "-m", "yt_dlp", "--socket-timeout", "20", "--retries", "3", "--dump-single-json", "--skip-download"]
     if cookies and os.path.exists(cookies):
         cmd += ["--cookies", cookies]
     cmd.append(url)
-    res = subprocess.run(cmd, capture_output=True, text=True)
+    res = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
     if res.returncode != 0:
-        raise RuntimeError(f"yt-dlp metadata failed:\n{res.stderr[-1200:]}")
+        raise RuntimeError(f"yt-dlp metadata failed:\n{res.stderr[-1000:]}")
     return json.loads(res.stdout)
 
 def extract_heatmap_scores(meta, bucket_sec=10):
@@ -112,7 +115,7 @@ def fetch_youtube_captions(url, cache_dir, cookies=None):
             with open(cache_json, "r", encoding="utf-8") as f:
                 data = json.load(f)
             if isinstance(data, list) and len(data) > 20:
-                print(f"  -> Loaded {len(data)} cached YouTube transcript lines.")
+                log(f"  -> Loaded {len(data)} cached YouTube transcript blocks.")
                 return data
         except Exception:
             pass
@@ -120,19 +123,21 @@ def fetch_youtube_captions(url, cache_dir, cookies=None):
     if os.path.isfile(url):
         return []
 
-    print("  -> Checking YouTube captions/auto-subs (instant 10h+ scout)...")
+    log("  -> Checking YouTube captions/auto-subs (fast scout)...")
     out_tpl = os.path.join(cache_dir, "yt_sub_raw.%(ext)s")
     cmd = [
-        py_cmd(), "-m", "yt_dlp", "--skip-download",
-        "--write-sub", "--write-auto-sub",
-        "--sub-lang", "en,en-orig,en-US,en-GB",
-        "--sub-format", "json3",
-        "-o", out_tpl
+        py_cmd(), "-m", "yt_dlp", "--socket-timeout", "20", "--retries", "2",
+        "--skip-download", "--write-sub", "--write-auto-sub",
+        "--sub-lang", "en,en-orig,en-US,en-GB", "--sub-format", "json3", "-o", out_tpl
     ]
     if cookies and os.path.exists(cookies):
         cmd += ["--cookies", cookies]
     cmd.append(url)
-    subprocess.run(cmd, capture_output=True, text=True)
+    try:
+        subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+    except subprocess.TimeoutExpired:
+        log("  -> Caption fetch timed out; continuing with audio/heatmap scout.")
+        return []
 
     json3_files = sorted(glob.glob(os.path.join(cache_dir, "yt_sub_raw*.json3")))
     if not json3_files:
@@ -146,8 +151,7 @@ def fetch_youtube_captions(url, cache_dir, cookies=None):
             segs = ev.get("segs")
             if not segs:
                 continue
-            txt = "".join(s.get("utf8", "") for s in segs).replace("\n", " ")
-            txt = re.sub(r"\s+", " ", txt).strip()
+            txt = re.sub(r"\s+", " ", "".join(s.get("utf8", "") for s in segs).replace("\n", " ")).strip()
             if not txt:
                 continue
             st = float(ev.get("tStartMs", 0)) / 1000.0
@@ -167,27 +171,32 @@ def fetch_youtube_captions(url, cache_dir, cookies=None):
     if merged:
         with open(cache_json, "w", encoding="utf-8") as f:
             json.dump(merged, f)
-        print(f"  -> Fetched {len(merged)} transcript blocks from YouTube captions.")
+        log(f"  -> Fetched {len(merged)} transcript blocks from YouTube captions.")
     return merged
 
 def download_audio_only(url, dest_m4a, cookies=None):
     if os.path.exists(dest_m4a) and os.path.getsize(dest_m4a) > 65536:
         return os.path.abspath(dest_m4a)
-    print("  -> Downloading lightweight audio-only track for hype peak scanning...")
+    log("  -> Downloading lightweight audio-only track for hype peak scanning...")
     cmd = [
-        py_cmd(), "-m", "yt_dlp", "-N", "16", "--concurrent-fragments", "16",
+        py_cmd(), "-m", "yt_dlp", "--socket-timeout", "20", "--retries", "3", "--fragment-retries", "3",
+        "-N", "16", "--concurrent-fragments", "16",
         "-f", "bestaudio[ext=m4a]/bestaudio", "-o", dest_m4a
     ]
     if cookies and os.path.exists(cookies):
         cmd += ["--cookies", cookies]
     cmd.append(url)
-    r = subprocess.run(cmd, capture_output=True, text=True)
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+    except subprocess.TimeoutExpired:
+        log("  -> Audio-only download timed out.")
+        return None
     if os.path.exists(dest_m4a) and os.path.getsize(dest_m4a) > 10240:
         return os.path.abspath(dest_m4a)
     for m in sorted(glob.glob(dest_m4a + "*")):
         if os.path.getsize(m) > 10240:
             return os.path.abspath(m)
-    print(f"  -> Audio-only download warning: {(r.stderr or '')[-300:]}")
+    log(f"  -> Audio-only warning: {(r.stderr or '')[-250:]}")
     return None
 
 def stream_audio_peaks_zero_disk(media_path, cache_json, bucket_sec=10):
@@ -222,7 +231,7 @@ def stream_audio_peaks_zero_disk(media_path, cache_json, bucket_sec=10):
                 continue
             samples = np.frombuffer(chunk[:usable], dtype=np.int16).astype(np.float32) / 32768.0
             rms_vals.append(20.0 * np.log10(float(np.sqrt(np.mean(samples * samples)) + 1e-8)))
-        proc.wait()
+        proc.wait(timeout=30)
         for i, db in enumerate(rms_vals):
             prev = rms_vals[i - 1] if i > 0 else db
             deltas[i] = round(max(0.0, db - prev) * 2.5 + max(0.0, db + 35.0), 2)
@@ -230,44 +239,40 @@ def stream_audio_peaks_zero_disk(media_path, cache_json, bucket_sec=10):
             with open(cache_json, "w", encoding="utf-8") as f:
                 json.dump({str(k): v for k, v in deltas.items()}, f)
     except Exception as e:
-        print(f"  -> Streaming audio scan warning: {e}")
+        log(f"  -> Audio scan warning: {e}")
     return deltas
 
 def download_source_1080p(url, dest_mp4, cookies=None, min_height=1080):
     if os.path.isfile(url):
-        print(f"[1/5] Using local/Drive video directly: {url}")
+        log(f"[1/5] Using local/Drive video directly: {url}")
         return os.path.abspath(url)
     if os.path.exists(dest_mp4) and os.path.getsize(dest_mp4) > 1024 * 1024:
         _, _, _, h = probe_video_info(dest_mp4)
         if h >= 720:
-            print(f"[1/5] Reusing cached HD source ({h}p): {dest_mp4}")
+            log(f"[1/5] Reusing cached HD source ({h}p): {dest_mp4}")
             return os.path.abspath(dest_mp4)
         try:
             os.remove(dest_mp4)
         except Exception:
             pass
 
-    print(f"[1/5] Downloading full HD source (>= {min_height}p, strictly no 360p fallback)...")
-    # Accept any high-res codec (VP9/AV1/H264) and NEVER fall back to progressive 360p /best!
-    fmt = (
-        f"bestvideo[height>={min_height}]+bestaudio/"
-        f"bestvideo[height>=720]+bestaudio"
-    )
+    log(f"[1/5] Downloading full HD source (>= {min_height}p, strictly no 360p fallback)...")
+    fmt = f"bestvideo[height>={min_height}]+bestaudio/bestvideo[height>=720]+bestaudio"
     cmd = [
-        py_cmd(), "-m", "yt_dlp",
+        py_cmd(), "-m", "yt_dlp", "--socket-timeout", "20", "--retries", "3", "--fragment-retries", "3",
         "-N", "16", "--concurrent-fragments", "16",
         "-f", fmt, "--merge-output-format", "mp4", "-o", dest_mp4
     ]
     if cookies and os.path.exists(cookies):
         cmd += ["--cookies", cookies]
     cmd.append(url)
-    res = subprocess.run(cmd, capture_output=True, text=True)
+    res = subprocess.run(cmd, capture_output=True, text=True, timeout=900)
     if res.returncode != 0 or not os.path.exists(dest_mp4):
-        raise RuntimeError(f"HD download failed:\n{res.stderr[-1500:]}")
+        raise RuntimeError(f"HD download failed:\n{res.stderr[-1200:]}")
     return os.path.abspath(dest_mp4)
 
 def download_surgical_section(url, start_s, end_s, out_mp4, cookies=None, min_height=1080):
-    """Downloads ONLY a frame-accurate, 0.000s-locked HD section (>=720p/1080p). Rejects 360p."""
+    """Fast keyframe-range HD download (no slow CPU re-encode, hard 75s timeout, rejects <720p)."""
     if os.path.exists(out_mp4) and os.path.getsize(out_mp4) > 50000:
         _, _, _, h = probe_video_info(out_mp4)
         if h >= 720:
@@ -280,7 +285,6 @@ def download_surgical_section(url, start_s, end_s, out_mp4, cookies=None, min_he
     s0 = max(0.0, float(start_s))
     s1 = max(s0 + 3.0, float(end_s))
 
-    # Strict HD-only formats + client retry if YouTube throttles a DASH format
     attempts = [
         (f"bestvideo[height>={min_height}]+bestaudio/bestvideo[height>=720]+bestaudio", []),
         (f"bestvideo[height>={min_height}]+bestaudio/bestvideo[height>=720]+bestaudio", ["--extractor-args", "youtube:player_client=tv,web"]),
@@ -295,27 +299,30 @@ def download_surgical_section(url, start_s, end_s, out_mp4, cookies=None, min_he
                 pass
         cmd = [
             py_cmd(), "-m", "yt_dlp", "--no-part",
-            "--download-sections", f"*{s0:.2f}-{s1:.2f}",
-            "--force-keyframes-at-cuts",
+            "--socket-timeout", "15", "--retries", "2", "--fragment-retries", "2",
+            "--download-sections", f"*{s0:.1f}-{s1:.1f}",
             "-f", fmt, "--merge-output-format", "mp4",
-            *extra_args,
-            "-o", out_mp4
+            *extra_args, "-o", out_mp4
         ]
         if cookies and os.path.exists(cookies):
             cmd += ["--cookies", cookies]
         cmd.append(url)
-        r = subprocess.run(cmd, capture_output=True, text=True)
+        try:
+            r = subprocess.run(cmd, capture_output=True, text=True, timeout=75)
+        except subprocess.TimeoutExpired:
+            last_err = "Section download timed out (75s)"
+            continue
         if os.path.exists(out_mp4) and os.path.getsize(out_mp4) > 50000:
             _, _, _, h = probe_video_info(out_mp4)
             if h >= 720:
                 return os.path.abspath(out_mp4), None
-            last_err = f"Got low-res {h}p; retrying for HD"
+            last_err = f"Low-res {h}p rejected"
             try:
                 os.remove(out_mp4)
             except Exception:
                 pass
         else:
-            last_err = (r.stderr or "").strip()[-280:]
+            last_err = (r.stderr or "").strip()[-240:]
     return None, last_err
 
 def _write_stereo_wav(path, mono_arr, sr=44100):
@@ -329,25 +336,23 @@ def _write_stereo_wav(path, mono_arr, sr=44100):
     return os.path.abspath(path)
 
 def generate_sfx_pack(sfx_dir):
-    """Synthesizes a 5-sound copyright-free viral Reels/Shorts SFX library locally (44.1kHz stereo)."""
+    """Synthesizes a 5-sound copyright-free viral Shorts SFX pack (44.1kHz stereo)."""
     os.makedirs(sfx_dir, exist_ok=True)
     sr = 44100
     rng = np.random.default_rng(77)
     pack = {}
 
-    # 1. Opening Cinematic Whoosh + Sub Drop
     p = os.path.join(sfx_dir, "whoosh_in.wav")
     if not os.path.exists(p):
-        dur = 0.60
+        dur = 0.58
         t = np.linspace(0, dur, int(sr * dur), endpoint=False)
         noise = rng.uniform(-1.0, 1.0, t.size)
         whoosh = np.convolve(noise * (np.sin(np.pi * (t / dur)) ** 2), np.ones(16) / 16.0, mode="same") * 0.55
-        pt = np.maximum(0.0, t - 0.14)
-        pop = np.sin(2 * np.pi * np.cumsum(175 * np.exp(-pt * 11.0) + 42) / sr) * np.exp(-pt * 22.0) * (t >= 0.14) * 0.85
+        pt = np.maximum(0.0, t - 0.12)
+        pop = np.sin(2 * np.pi * np.cumsum(175 * np.exp(-pt * 11.0) + 42) / sr) * np.exp(-pt * 22.0) * (t >= 0.12) * 0.85
         _write_stereo_wav(p, whoosh + pop, sr)
     pack["whoosh_in"] = os.path.abspath(p)
 
-    # 2. Viral Vine Boom / Bass Shock Impact (for screams, shock, big reactions)
     p = os.path.join(sfx_dir, "vine_boom.wav")
     if not os.path.exists(p):
         dur = 0.85
@@ -359,7 +364,6 @@ def generate_sfx_pack(sfx_dir):
         _write_stereo_wav(p, punch + click, sr)
     pack["vine_boom"] = os.path.abspath(p)
 
-    # 3. Crisp UI Pop / Ding (for punchlines, questions, callouts)
     p = os.path.join(sfx_dir, "pop_ding.wav")
     if not os.path.exists(p):
         dur = 0.30
@@ -370,7 +374,6 @@ def generate_sfx_pack(sfx_dir):
         _write_stereo_wav(p, tone + harm, sr)
     pack["pop_ding"] = os.path.abspath(p)
 
-    # 4. Tension Riser -> Hit (placed right before the clip's audio climax)
     p = os.path.join(sfx_dir, "riser_hit.wav")
     if not os.path.exists(p):
         dur = 0.95
@@ -384,7 +387,6 @@ def generate_sfx_pack(sfx_dir):
         _write_stereo_wav(p, riser + sw + hit, sr)
     pack["riser_hit"] = os.path.abspath(p)
 
-    # 5. Snappy Gaming Glitch / Zap (for rapid hype moments)
     p = os.path.join(sfx_dir, "glitch_zap.wav")
     if not os.path.exists(p):
         dur = 0.28
@@ -396,22 +398,17 @@ def generate_sfx_pack(sfx_dir):
 
     return pack
 
-def plan_clip_sfx(clip_src_mp4, seek_s, render_dur, rel_segs, sfx_pack):
-    """Analyzes the clip's actual audio spikes + transcript hype words to place context-aware SFX."""
-    if not sfx_pack:
+def plan_clip_sfx_stage1(stage1_mp4, render_dur, rel_segs, sfx_pack):
+    """Analyzes the 0.000s-locked stage1 clip's audio spikes + hype words to place context-aware SFX."""
+    if not sfx_pack or not os.path.exists(stage1_mp4):
         return []
-    events = [(sfx_pack["whoosh_in"], 40, 0.78)]  # Always open with crisp hook whoosh
+    events = [(sfx_pack["whoosh_in"], 30, 0.78)]
 
-    # Scan 0.25s audio energy inside this clip to find real reaction/climax moments
-    cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error"]
-    if seek_s is not None:
-        fast = max(0.0, seek_s - 4.0)
-        fine = seek_s - fast
-        cmd += ["-ss", f"{fast:.3f}", "-i", os.path.abspath(clip_src_mp4), "-ss", f"{fine:.3f}"]
-    else:
-        cmd += ["-i", os.path.abspath(clip_src_mp4)]
-    cmd += ["-t", f"{render_dur:.3f}", "-vn", "-ac", "1", "-ar", "16000", "-f", "s16le", "pipe:1"]
-
+    cmd = [
+        "ffmpeg", "-hide_banner", "-loglevel", "error",
+        "-i", os.path.abspath(stage1_mp4),
+        "-vn", "-ac", "1", "-ar", "16000", "-f", "s16le", "pipe:1"
+    ]
     rms_list = []
     try:
         proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
@@ -425,16 +422,14 @@ def plan_clip_sfx(clip_src_mp4, seek_s, render_dur, rel_segs, sfx_pack):
                 continue
             arr = np.frombuffer(ch[:u], dtype=np.int16).astype(np.float32) / 32768.0
             rms_list.append(20.0 * np.log10(float(np.sqrt(np.mean(arr * arr)) + 1e-8)))
-        proc.wait()
+        proc.wait(timeout=15)
     except Exception:
         rms_list = []
 
     used_times = [0.0]
-
-    # 1. Climax audio spike -> Vine Boom + Riser leading into it!
     if len(rms_list) > 16:
         jumps = []
-        for idx_r in range(10, len(rms_list) - 4):  # Skip first 2.5s and last 1s
+        for idx_r in range(10, len(rms_list) - 4):
             t_sec = idx_r * 0.25
             delta = max(0.0, rms_list[idx_r] - rms_list[idx_r - 2])
             score = delta * 2.2 + max(0.0, rms_list[idx_r] + 28.0)
@@ -442,21 +437,17 @@ def plan_clip_sfx(clip_src_mp4, seek_s, render_dur, rel_segs, sfx_pack):
         jumps.sort(key=lambda x: x[0], reverse=True)
         if jumps:
             climax_t = jumps[0][1]
-            # Place riser 0.72s before climax hit if room, else vine_boom directly on peak
             if climax_t >= 3.2:
                 events.append((sfx_pack["riser_hit"], int((climax_t - 0.72) * 1000), 0.80))
             else:
                 events.append((sfx_pack["vine_boom"], int(climax_t * 1000), 0.90))
             used_times.append(climax_t)
-
-            # Secondary peak -> Vine Boom or Glitch Zap
             for _, t2 in jumps[1:]:
                 if all(abs(t2 - ut) >= 6.0 for ut in used_times):
                     events.append((sfx_pack["vine_boom"], int(t2 * 1000), 0.86))
                     used_times.append(t2)
                     break
 
-    # 2. Keyword-driven SFX from transcript (shock words -> boom, callouts/questions -> pop_ding)
     shock_re = re.compile(r"\b(no way|what the|wtf|bro|insane|crazy|dead|cooked|holy|oh my god|clip that)\b", re.I)
     callout_re = re.compile(r"\b(wait|look|watch|listen|secret|actually|why|how)\b", re.I)
     for s in (rel_segs or []):
@@ -475,10 +466,8 @@ def plan_clip_sfx(clip_src_mp4, seek_s, render_dur, rel_segs, sfx_pack):
             events.append((sfx_pack["pop_ding"], int(st * 1000), 0.75))
             used_times.append(st)
 
-    # Ensure at least 2 dynamic sounds on clips >= 18s
-    if len(events) < 2 and render_dur >= 18.0:
-        mid_t = render_dur * 0.52
-        events.append((sfx_pack["pop_ding"], int(mid_t * 1000), 0.75))
+    if len(events) < 2 and render_dur >= 16.0:
+        events.append((sfx_pack["pop_ding"], int(render_dur * 0.50 * 1000), 0.75))
 
     return events[:5]
 
@@ -486,37 +475,29 @@ def load_whisper_once():
     try:
         from faster_whisper import WhisperModel
     except Exception as e:
-        print(f"  -> WARNING: faster-whisper not installed ({e}).")
+        log(f"  -> WARNING: faster-whisper not installed ({e}).")
         return None
     has_gpu = subprocess.run(["nvidia-smi"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0
     attempts = [("cuda", "float16", "small"), ("cpu", "int8", "base")] if has_gpu else [("cpu", "int8", "base")]
     for device, compute, model_name in attempts:
         try:
             m = WhisperModel(model_name, device=device, compute_type=compute)
-            print(f"  -> Loaded faster-whisper once on {device.upper()} ({model_name}).")
+            log(f"  -> Loaded faster-whisper once on {device.upper()} ({model_name}).")
             return m
         except Exception as e:
-            print(f"  -> Whisper load ({device}/{model_name}) failed: {e}")
+            log(f"  -> Whisper load ({device}/{model_name}) failed: {e}")
     return None
 
-def transcribe_slice_exact(whisper_model, media_path, tmp_wav, start_s=None, dur_s=None):
-    """Uses exact hybrid seek matching _render_worker so audio and video start on the EXACT same millisecond."""
-    if whisper_model is None or not media_path or not os.path.exists(media_path):
+def transcribe_stage1_exact(whisper_model, stage1_mp4, tmp_wav):
+    """Zero-seek transcription directly on the 0.000s-locked stage1 clip -> 100% millisecond subtitle sync!"""
+    if whisper_model is None or not stage1_mp4 or not os.path.exists(stage1_mp4):
         return []
-    cmd = ["ffmpeg", "-y", "-hide_banner", "-loglevel", "error"]
-    if start_s is not None:
-        fast_seek = max(0.0, float(start_s) - 4.0)
-        fine_seek = float(start_s) - fast_seek
-        cmd += ["-ss", f"{fast_seek:.3f}", "-i", os.path.abspath(media_path), "-ss", f"{fine_seek:.3f}"]
-    else:
-        cmd += ["-i", os.path.abspath(media_path)]
-    if dur_s is not None:
-        cmd += ["-t", f"{dur_s:.3f}"]
-    cmd += [
-        "-vn", "-af", "asetpts=PTS-STARTPTS,aresample=async=1:first_pts=0",
-        "-ac", "1", "-ar", "16000", "-c:a", "pcm_s16le", tmp_wav
+    cmd = [
+        "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+        "-i", os.path.abspath(stage1_mp4),
+        "-vn", "-ac", "1", "-ar", "16000", "-c:a", "pcm_s16le", tmp_wav
     ]
-    subprocess.run(cmd, capture_output=True, text=True)
+    subprocess.run(cmd, capture_output=True, text=True, timeout=30)
     if not os.path.exists(tmp_wav) or os.path.getsize(tmp_wav) < 2048:
         return []
     try:
@@ -539,7 +520,7 @@ def transcribe_slice_exact(whisper_model, media_path, tmp_wav, start_s=None, dur
                 return out
         return []
     except Exception as e:
-        print(f"  -> Clip Whisper warning: {e}")
+        log(f"  -> Clip Whisper warning: {e}")
         return []
     finally:
         try:
@@ -661,22 +642,22 @@ def _call_free_ai(prompt, provider, ollama_model):
                         "https://api.groq.com/openai/v1/chat/completions",
                         headers={"Authorization": f"Bearer {groq_key}", "Content-Type": "application/json"},
                         json={"model": model_id, "messages": [{"role": "user", "content": prompt}], "temperature": 0.35},
-                        timeout=45,
+                        timeout=25,
                     )
                     if r.status_code == 429:
-                        time.sleep(2.0)
+                        time.sleep(1.5)
                         continue
                     r.raise_for_status()
                     return r.json()["choices"][0]["message"]["content"]
                 except Exception as e:
-                    print(f"  -> Groq ({model_id}) skipped: {e}")
+                    log(f"  -> Groq ({model_id}) skipped: {e}")
         elif p == "gemini" and gemini_key:
             for model_id in GEMINI_FREE_MODELS:
                 try:
                     r = requests.post(
                         f"https://generativelanguage.googleapis.com/v1beta/models/{model_id}:generateContent?key={gemini_key}",
                         json={"contents": [{"parts": [{"text": prompt}]}]},
-                        timeout=45,
+                        timeout=25,
                     )
                     if r.status_code in (429, 503):
                         time.sleep(1.5)
@@ -684,18 +665,18 @@ def _call_free_ai(prompt, provider, ollama_model):
                     r.raise_for_status()
                     return r.json()["candidates"][0]["content"]["parts"][0]["text"]
                 except Exception as e:
-                    print(f"  -> Gemini ({model_id}) skipped: {e}")
+                    log(f"  -> Gemini ({model_id}) skipped: {e}")
         elif p == "ollama":
             try:
                 r = requests.post(
                     "http://127.0.0.1:11434/api/generate",
                     json={"model": ollama_model, "prompt": prompt, "stream": False, "options": {"temperature": 0.35}},
-                    timeout=120,
+                    timeout=90,
                 )
                 r.raise_for_status()
                 return r.json().get("response", "")
             except Exception as e:
-                print(f"  -> Ollama ({ollama_model}) skipped: {e}")
+                log(f"  -> Ollama ({ollama_model}) skipped: {e}")
     return ""
 
 def _overlaps_any(st, en, picked, min_gap_ratio=0.55):
@@ -710,7 +691,7 @@ def select_clips_scalable(scout_segs, energy_scores, heatmap_scores, duration, n
     eff_min = min(float(min_len), max(5.0, float(duration) * 0.8))
     max_possible = max(1, int(duration // max(eff_min * 0.85, 5.0)))
     target_clips = min(num_clips, max_possible)
-    print(f"[2/5] Selecting {target_clips} hook-to-payoff clips ({min_len}s-{max_len}s) across {duration/60:.1f} min...")
+    log(f"[2/5] Selecting {target_clips} hook-to-payoff clips ({min_len}s-{max_len}s) across {duration/60:.1f} min...")
 
     candidates = build_stratified_candidates(scout_segs, energy_scores, heatmap_scores, duration, target_clips, min_len, max_len)
     picked = []
@@ -978,46 +959,41 @@ def _cam_box_norm(cam_pos, cam_w, cam_h, cam_x, cam_y):
         rx, ry = 0.0, 0.0
     return cw, ch, rx, ry
 
-def _build_video_filter(layout, cam_pos, cam_w, cam_h, cam_x, cam_y, ass_filename=None):
+def _build_layout_filter(layout, cam_pos, cam_w, cam_h, cam_x, cam_y):
     src_chain = "[0:v]setpts=PTS-STARTPTS[vsrc]"
     cw, ch, rx, ry = _cam_box_norm(cam_pos, cam_w, cam_h, cam_x, cam_y)
     cam_crop = f"crop=iw*{cw:.3f}:ih*{ch:.3f}:iw*{rx:.3f}:ih*{ry:.3f}"
 
     if layout == "crop-focus":
-        base = f"{src_chain};[vsrc]scale=1080:1920:force_original_aspect_ratio=increase:flags=lanczos,crop=1080:1920[vbase]"
-    elif layout == "cam-top":
-        base = (
+        return f"{src_chain};[vsrc]scale=1080:1920:force_original_aspect_ratio=increase:flags=lanczos,crop=1080:1920[vout]"
+    if layout == "cam-top":
+        return (
             f"{src_chain};[vsrc]split[cam][game];"
             f"[cam]{cam_crop},scale=1080:720:force_original_aspect_ratio=increase:flags=lanczos,crop=1080:720[top];"
             "[game]scale=1080:1200:force_original_aspect_ratio=increase:flags=lanczos,crop=1080:1200[bot];"
-            "[top][bot]vstack[vbase]"
+            "[top][bot]vstack[vout]"
         )
-    elif layout == "cam-bottom":
-        base = (
+    if layout == "cam-bottom":
+        return (
             f"{src_chain};[vsrc]split[game][cam];"
             "[game]scale=1080:1200:force_original_aspect_ratio=increase:flags=lanczos,crop=1080:1200[top];"
             f"[cam]{cam_crop},scale=1080:720:force_original_aspect_ratio=increase:flags=lanczos,crop=1080:720[bot];"
-            "[top][bot]vstack[vbase]"
+            "[top][bot]vstack[vout]"
         )
-    elif layout in ("pip-top-right", "pip-top-left"):
+    if layout in ("pip-top-right", "pip-top-left"):
         ox = "W-w-36" if layout == "pip-top-right" else "36"
-        base = (
+        return (
             f"{src_chain};[vsrc]split[cam][game];"
             "[game]scale=1080:1920:force_original_aspect_ratio=increase:flags=lanczos,crop=1080:1920[bg];"
             f"[cam]{cam_crop},scale=360:360:force_original_aspect_ratio=increase:flags=lanczos,crop=360:360,pad=372:372:6:6:white[pip];"
-            f"[bg][pip]overlay={ox}:90[vbase]"
+            f"[bg][pip]overlay={ox}:90[vout]"
         )
-    else:
-        base = (
-            f"{src_chain};[vsrc]split[orig][bg];"
-            "[bg]scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,boxblur=18:2,eq=brightness=-0.22[bgd];"
-            "[orig]scale=1080:1920:force_original_aspect_ratio=decrease:flags=lanczos[fg];"
-            "[bgd][fg]overlay=(W-w)/2:(H-h)/2[vbase]"
-        )
-
-    if ass_filename:
-        return f"{base};[vbase]ass={ass_filename}:fontsdir=fonts[vout]"
-    return f"{base};[vbase]null[vout]"
+    return (
+        f"{src_chain};[vsrc]split[orig][bg];"
+        "[bg]scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,boxblur=18:2,eq=brightness=-0.22[bgd];"
+        "[orig]scale=1080:1920:force_original_aspect_ratio=decrease:flags=lanczos[fg];"
+        "[bgd][fg]overlay=(W-w)/2:(H-h)/2[vout]"
+    )
 
 def run_instant_preview(url, cookies, min_height, tmp_dir, out_dir, layout, cam_pos, cam_w, cam_h, cam_x, cam_y, caption_style, hook_style, font_family, preview_sec):
     if os.path.isfile(url):
@@ -1025,7 +1001,7 @@ def run_instant_preview(url, cookies, min_height, tmp_dir, out_dir, layout, cam_
         seek_in = max(1.0, float(preview_sec))
     else:
         prev_mp4 = os.path.join(tmp_dir, f"prev_{int(preview_sec)}.mp4")
-        print(f"Downloading 4-second HD preview slice at {int(preview_sec)}s...")
+        log(f"Downloading 4-second HD preview slice at {int(preview_sec)}s...")
         prev_src, err = download_surgical_section(url, preview_sec, preview_sec + 4.0, prev_mp4, cookies, min_height)
         if not prev_src:
             raise RuntimeError(f"Preview slice download failed: {err}")
@@ -1038,7 +1014,7 @@ def run_instant_preview(url, cookies, min_height, tmp_dir, out_dir, layout, cam_
     box_vf = f"drawbox=x=iw*{rx:.3f}:y=ih*{ry:.3f}:w=iw*{cw:.3f}:h=ih*{ch:.3f}:color=lime@0.95:t=8"
     subprocess.run(
         ["ffmpeg", "-y", "-hide_banner", "-loglevel", "error", "-ss", f"{seek_in:.2f}", "-i", prev_src, "-vf", box_vf, "-vframes", "1", "-q:v", "2", src_box_jpg],
-        capture_output=True, text=True
+        capture_output=True, text=True, timeout=30
     )
 
     sample_segs = [{
@@ -1053,7 +1029,8 @@ def run_instant_preview(url, cookies, min_height, tmp_dir, out_dir, layout, cam_
     }]
     ass_path = os.path.join(tmp_dir, "preview_sub.ass")
     ass_name, _ = build_styled_ass_relative(sample_segs, 3.0, ass_path, caption_style, hook_style, "HE DIDN'T EXPECT THIS", layout, font_family)
-    vfilter = _build_video_filter(layout, cam_pos, cam_w, cam_h, cam_x, cam_y, ass_name)
+    base_vf = _build_layout_filter(layout, cam_pos, cam_w, cam_h, cam_x, cam_y)
+    vfilter = base_vf.replace("[vout]", "[vbase]") + (f";[vbase]ass={ass_name}:fontsdir=fonts[vout]" if ass_name else ";[vbase]null[vout]")
     fc_file = os.path.join(tmp_dir, "preview_fc.txt")
     with open(fc_file, "w", encoding="utf-8") as f:
         f.write(vfilter)
@@ -1061,75 +1038,52 @@ def run_instant_preview(url, cookies, min_height, tmp_dir, out_dir, layout, cam_
     r = subprocess.run(
         ["ffmpeg", "-y", "-hide_banner", "-loglevel", "error", "-ss", f"{seek_in:.2f}", "-t", "1.2", "-i", prev_src,
          "-filter_complex_script", os.path.basename(fc_file), "-map", "[vout]", "-ss", "0.55", "-vframes", "1", "-q:v", "2", os.path.abspath(rendered_jpg)],
-        cwd=tmp_dir, capture_output=True, text=True
+        cwd=tmp_dir, capture_output=True, text=True, timeout=30
     )
     if r.returncode != 0:
-        print(f"Preview render warning: {(r.stderr or '')[-300:]}")
+        log(f"Preview render warning: {(r.stderr or '')[-300:]}")
     else:
-        print(f"Preview ready!\n  1) {src_box_jpg}\n  2) {rendered_jpg}")
+        log(f"Preview ready!\n  1) {src_box_jpg}\n  2) {rendered_jpg}")
 
 def detect_fast_1080p_encoder():
     res = subprocess.run(["ffmpeg", "-encoders"], capture_output=True, text=True)
     enc = res.stdout or ""
     has_nv = subprocess.run(["nvidia-smi"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0
     if "h264_nvenc" in enc and has_nv:
-        return ("h264_nvenc", ["-preset", "p4", "-rc", "vbr", "-cq", "19", "-b:v", "8M", "-maxrate", "14M", "-bufsize", "20M"])
+        return ("h264_nvenc", ["-preset", "p2", "-rc", "vbr", "-cq", "19", "-b:v", "8M", "-maxrate", "14M", "-bufsize", "20M"])
     if "h264_qsv" in enc:
         return ("h264_qsv", ["-preset", "veryfast", "-global_quality", "19", "-maxrate", "14M", "-bufsize", "20M"])
     return ("libx264", ["-preset", "veryfast", "-crf", "19"])
 
-def _render_worker(args_tuple):
-    (
-        clip_src_mp4, seek_s, render_dur, idx, clip, tmp_dir, local_shorts, final_shorts,
-        enc_name, enc_args, rel_segs, caption_style, hook_style,
-        layout, cam_pos, cam_w, cam_h, cam_x, cam_y, sfx_events, has_audio, font_family
-    ) = args_tuple
+def _stage1_trim_worker(args_tuple):
+    """Stage 1: Creates a clean 0.000s-locked 1080x1920 vertical clip with synced audio."""
+    (src_mp4, seek_s, render_dur, idx, tmp_dir, enc_name, enc_args, layout, cam_pos, cam_w, cam_h, cam_x, cam_y, has_audio) = args_tuple
     t0 = time.time()
-    fname = f"short_{idx:03d}.mp4"
-    final_path = os.path.abspath(os.path.join(final_shorts, fname))
-    if os.path.exists(final_path) and os.path.getsize(final_path) > 10240:
-        return idx, fname, 0.0, 0, 0, None
+    out_stage1 = os.path.abspath(os.path.join(tmp_dir, f"stage1_{idx:03d}.mp4"))
+    if os.path.exists(out_stage1) and os.path.getsize(out_stage1) > 10240:
+        return idx, out_stage1, time.time() - t0, None
 
-    out_local = os.path.abspath(os.path.join(local_shorts, fname))
-    ass_path = os.path.join(tmp_dir, f"sub_{idx:03d}.ass")
-    ass_name, wcount = build_styled_ass_relative(
-        rel_segs, render_dur, ass_path, caption_style, hook_style, clip["title"], layout, font_family, seed_val=idx
-    )
-    vfilter = _build_video_filter(layout, cam_pos, cam_w, cam_h, cam_x, cam_y, ass_name)
+    vf = _build_layout_filter(layout, cam_pos, cam_w, cam_h, cam_x, cam_y)
+    if has_audio:
+        fc = f"{vf};\n[0:a]asetpts=PTS-STARTPTS,aresample=async=1:first_pts=0,aformat=sample_rates=44100:channel_layouts=stereo[aout]"
+        maps = ["-map", "[vout]", "-map", "[aout]"]
+    else:
+        fc = vf
+        maps = ["-map", "[vout]"]
 
-    # Frame-accurate hybrid seek matching transcribe_slice_exact -> ZERO subtitle drift!
+    fc_file = os.path.join(tmp_dir, f"fc1_{idx:03d}.txt")
+    with open(fc_file, "w", encoding="utf-8") as f:
+        f.write(fc)
+
     inputs = []
     if seek_s is not None:
         fast_seek = max(0.0, float(seek_s) - 4.0)
         fine_seek = float(seek_s) - fast_seek
-        inputs += ["-ss", f"{fast_seek:.3f}", "-i", os.path.abspath(clip_src_mp4), "-ss", f"{fine_seek:.3f}", "-t", f"{render_dur:.3f}"]
+        inputs += ["-ss", f"{fast_seek:.3f}", "-i", os.path.abspath(src_mp4), "-ss", f"{fine_seek:.3f}", "-t", f"{render_dur:.3f}"]
     else:
-        inputs += ["-i", os.path.abspath(clip_src_mp4), "-t", f"{render_dur:.3f}"]
+        inputs += ["-i", os.path.abspath(src_mp4), "-t", f"{render_dur:.3f}"]
 
-    valid_sfx = [(p, d, v) for (p, d, v) in (sfx_events or []) if p and os.path.exists(p)]
-    if has_audio and valid_sfx:
-        sfx_chains = []
-        mix_labels = ["[main_a]"]
-        for s_idx, (sp, delay_ms, vol) in enumerate(valid_sfx, 1):
-            inputs += ["-i", os.path.abspath(sp)]
-            sfx_chains.append(f"[{s_idx}:a]adelay={int(delay_ms)}|{int(delay_ms)},volume={vol:.2f}[sfx{s_idx}]")
-            mix_labels.append(f"[sfx{s_idx}]")
-        fc = (
-            f"{vfilter};\n"
-            "[0:a]asetpts=PTS-STARTPTS,aresample=async=1:first_pts=0,aformat=sample_rates=44100:channel_layouts=stereo[main_a];\n"
-            + ";\n".join(sfx_chains) + ";\n"
-            + f"{''.join(mix_labels)}amix=inputs={len(mix_labels)}:duration=first:dropout_transition=0:normalize=0,alimiter=limit=0.95[aout]"
-        )
-        maps = ["-map", "[vout]", "-map", "[aout]"]
-    else:
-        fc = f"{vfilter};\n[0:a]asetpts=PTS-STARTPTS,aresample=async=1:first_pts=0[aout]" if has_audio else vfilter
-        maps = ["-map", "[vout]", "-map", "[aout]"] if has_audio else ["-map", "[vout]"]
-
-    fc_file = os.path.join(tmp_dir, f"fc_{idx:03d}.txt")
-    with open(fc_file, "w", encoding="utf-8") as f:
-        f.write(fc)
-
-    def _run_enc(e_name, e_args):
+    def _run(e_name, e_args):
         cmd = [
             "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
             *inputs,
@@ -1138,19 +1092,109 @@ def _render_worker(args_tuple):
             "-pix_fmt", "yuv420p",
             "-c:v", e_name, *e_args,
             "-c:a", "aac", "-b:a", "192k",
+            out_stage1
+        ]
+        return subprocess.run(cmd, cwd=tmp_dir, capture_output=True, text=True, timeout=180)
+
+    try:
+        r = _run(enc_name, enc_args)
+        if r.returncode != 0 and enc_name != "libx264":
+            r = _run("libx264", ["-preset", "veryfast", "-crf", "19"])
+    except subprocess.TimeoutExpired:
+        return idx, None, time.time() - t0, "Stage 1 encode timed out"
+
+    if os.path.exists(out_stage1) and os.path.getsize(out_stage1) > 10240:
+        return idx, out_stage1, time.time() - t0, None
+    return idx, None, time.time() - t0, (r.stderr or "").strip()[-300:]
+
+def _stage3_finish_worker(args_tuple):
+    """Stage 3: Burns 0.000s-locked captions/hook + mixes dynamic SFX onto stage1 clip and saves to Drive."""
+    (
+        stage1_mp4, render_dur, idx, clip, tmp_dir, local_shorts, final_shorts,
+        enc_name, enc_args, rel_segs, caption_style, hook_style,
+        layout, sfx_events, has_audio, font_family
+    ) = args_tuple
+    t0 = time.time()
+    fname = f"short_{idx:03d}.mp4"
+    final_path = os.path.abspath(os.path.join(final_shorts, fname))
+    out_local = os.path.abspath(os.path.join(local_shorts, fname))
+
+    ass_path = os.path.join(tmp_dir, f"sub_{idx:03d}.ass")
+    ass_name, wcount = build_styled_ass_relative(
+        rel_segs, render_dur, ass_path, caption_style, hook_style, clip["title"], layout, font_family, seed_val=idx
+    )
+    valid_sfx = [(p, d, v) for (p, d, v) in (sfx_events or []) if p and os.path.exists(p)]
+
+    # Fast path: if no captions/hook AND no SFX, zero extra re-encoding needed!
+    if not ass_name and not valid_sfx:
+        subprocess.run(
+            ["ffmpeg", "-y", "-hide_banner", "-loglevel", "error", "-i", stage1_mp4, "-c", "copy", "-movflags", "+faststart", out_local],
+            capture_output=True, text=True, timeout=60
+        )
+        if os.path.exists(out_local) and os.path.getsize(out_local) > 10240:
+            shutil.copy2(out_local, final_path)
+            try:
+                os.remove(stage1_mp4)
+            except Exception:
+                pass
+            return idx, fname, time.time() - t0, wcount, 0, None
+
+    inputs = ["-i", os.path.abspath(stage1_mp4)]
+    vf_line = f"[0:v]ass={ass_name}:fontsdir=fonts[vout]" if ass_name else "[0:v]null[vout]"
+
+    if has_audio and valid_sfx:
+        sfx_chains = []
+        mix_labels = ["[main_a]"]
+        for s_idx, (sp, delay_ms, vol) in enumerate(valid_sfx, 1):
+            inputs += ["-i", os.path.abspath(sp)]
+            sfx_chains.append(f"[{s_idx}:a]adelay={int(delay_ms)}|{int(delay_ms)},volume={vol:.2f}[sfx{s_idx}]")
+            mix_labels.append(f"[sfx{s_idx}]")
+        fc = (
+            f"{vf_line};\n"
+            "[0:a]aformat=sample_rates=44100:channel_layouts=stereo[main_a];\n"
+            + ";\n".join(sfx_chains) + ";\n"
+            + f"{''.join(mix_labels)}amix=inputs={len(mix_labels)}:duration=first:dropout_transition=0:normalize=0,alimiter=limit=0.95[aout]"
+        )
+        maps = ["-map", "[vout]", "-map", "[aout]"]
+        audio_args = ["-c:a", "aac", "-b:a", "192k"]
+    else:
+        fc = vf_line
+        maps = ["-map", "[vout]", "-map", "0:a?"]
+        audio_args = ["-c:a", "copy"]
+
+    fc_file = os.path.join(tmp_dir, f"fc3_{idx:03d}.txt")
+    with open(fc_file, "w", encoding="utf-8") as f:
+        f.write(fc)
+
+    def _run(e_name, e_args):
+        cmd = [
+            "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+            *inputs,
+            "-filter_complex_script", os.path.basename(fc_file),
+            *maps,
+            "-pix_fmt", "yuv420p",
+            "-c:v", e_name, *e_args,
+            *audio_args,
             "-movflags", "+faststart",
             out_local
         ]
-        return subprocess.run(cmd, cwd=tmp_dir, capture_output=True, text=True)
+        return subprocess.run(cmd, cwd=tmp_dir, capture_output=True, text=True, timeout=180)
 
-    r = _run_enc(enc_name, enc_args)
-    if r.returncode != 0 and enc_name != "libx264":
-        r = _run_enc("libx264", ["-preset", "veryfast", "-crf", "19"])
+    try:
+        r = _run(enc_name, enc_args)
+        if r.returncode != 0 and enc_name != "libx264":
+            r = _run("libx264", ["-preset", "veryfast", "-crf", "19"])
+    except subprocess.TimeoutExpired:
+        return idx, "FAILED", time.time() - t0, wcount, len(valid_sfx), "Stage 3 burn-in timed out"
 
     if os.path.exists(out_local) and os.path.getsize(out_local) > 10240:
         shutil.copy2(out_local, final_path)
+        try:
+            os.remove(stage1_mp4)
+        except Exception:
+            pass
         return idx, fname, time.time() - t0, wcount, len(valid_sfx), None
-    return idx, "FAILED", time.time() - t0, wcount, len(valid_sfx), (r.stderr or "").strip()[-350:]
+    return idx, "FAILED", time.time() - t0, wcount, len(valid_sfx), (r.stderr or "").strip()[-300:]
 
 def _score_frame_clickbait(mp4_path, ts):
     cmd = [
@@ -1158,7 +1202,7 @@ def _score_frame_clickbait(mp4_path, ts):
         "-ss", f"{ts:.2f}", "-i", mp4_path,
         "-vf", "scale=180:320", "-vframes", "1", "-f", "rawvideo", "-pix_fmt", "rgb24", "pipe:1"
     ]
-    r = subprocess.run(cmd, capture_output=True)
+    r = subprocess.run(cmd, capture_output=True, timeout=15)
     if r.returncode != 0 or len(r.stdout) < 180 * 320 * 3:
         return -1.0
     arr = np.frombuffer(r.stdout[: 180 * 320 * 3], dtype=np.uint8).reshape((320, 180, 3)).astype(np.float32)
@@ -1193,9 +1237,12 @@ def _find_clickbait_timestamp(mp4_path, dur):
 
     best_t, best_sc = cand_times[0] if cand_times else dur * 0.5, -1.0
     for t_c in cand_times[:7]:
-        sc = _score_frame_clickbait(mp4_path, t_c)
-        if sc > best_sc:
-            best_sc, best_t = sc, t_c
+        try:
+            sc = _score_frame_clickbait(mp4_path, t_c)
+            if sc > best_sc:
+                best_sc, best_t = sc, t_c
+        except Exception:
+            continue
     return best_t
 
 def _render_clickbait_thumbnail(mp4_path, thumb_jpg, title, dur, tmp_dir, font_family):
@@ -1220,18 +1267,18 @@ def _render_clickbait_thumbnail(mp4_path, thumb_jpg, title, dur, tmp_dir, font_f
     r = subprocess.run(
         ["ffmpeg", "-y", "-hide_banner", "-loglevel", "error", "-ss", f"{peak_t:.2f}", "-i", os.path.abspath(mp4_path),
          "-vf", vf, "-vframes", "1", "-q:v", "2", os.path.abspath(thumb_jpg)],
-        cwd=tmp_dir, capture_output=True, text=True
+        cwd=tmp_dir, capture_output=True, text=True, timeout=30
     )
     if r.returncode != 0 or not os.path.exists(thumb_jpg):
         subprocess.run(
             ["ffmpeg", "-y", "-hide_banner", "-loglevel", "error", "-ss", f"{peak_t:.2f}", "-i", os.path.abspath(mp4_path),
              "-vframes", "1", "-q:v", "2", os.path.abspath(thumb_jpg)],
-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=30
         )
     return peak_t
 
 def build_top_10_viral(session_dir, rows, tmp_dir, font_family):
-    print("[5/5] Building top_10_viral/ folder + 100% clickbait core-moment thumbnails...")
+    log("[5/5] Building top_10_viral/ folder + 100% clickbait core-moment thumbnails...")
     top_dir = os.path.join(session_dir, "top_10_viral")
     shorts_dir = os.path.join(session_dir, "shorts")
     if os.path.exists(top_dir):
@@ -1247,14 +1294,16 @@ def build_top_10_viral(session_dir, rows, tmp_dir, font_family):
         thumb_jpg = os.path.join(top_dir, f"rank_{rank:02d}_{os.path.splitext(r['file'])[0]}_thumb.jpg")
         shutil.copy2(src_mp4, dst_mp4)
         pk = _render_clickbait_thumbnail(dst_mp4, thumb_jpg, r["title"], r.get("duration", 30.0), tmp_dir, font_family)
-        print(f"  -> Top #{rank:02d}: {os.path.basename(dst_mp4)} | clickbait thumb @ {pk:.1f}s")
-    print(f"  -> Saved {len(ranked)} top viral clips + clickbait thumbnails in {top_dir}")
+        log(f"  -> Top #{rank:02d}: {os.path.basename(dst_mp4)} | clickbait thumb @ {pk:.1f}s")
+    log(f"  -> Saved {len(ranked)} top viral clips + clickbait thumbnails in {top_dir}")
 
 def main():
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(line_buffering=True)
     t0 = time.time()
-    parser = argparse.ArgumentParser(description="HypeClipper v9: Millisecond-Locked Subtitles, Strict HD Enforcement, Dynamic Multi-SFX, Clickbait Thumbnails")
+    parser = argparse.ArgumentParser(description="HypeClipper v10: Zero-Drift 3-Stage Sync, Anti-Hang Timeouts, Strict HD, Dynamic Multi-SFX, Clickbait Thumbnails")
     parser.add_argument("url")
-    parser.add_argument("--clips", type=int, default=40)
+    parser.add_argument("--clips", type=int, default=20)
     parser.add_argument("--min-len", type=int, default=25)
     parser.add_argument("--max-len", type=int, default=50)
     parser.add_argument("--min-height", type=int, default=1080)
@@ -1270,7 +1319,7 @@ def main():
     parser.add_argument("--cam-x", type=float, default=0.0)
     parser.add_argument("--cam-y", type=float, default=0.38)
     parser.add_argument("--sfx", action="store_true")
-    parser.add_argument("--no-subtitles", action="store_true", help="Turn subtitles completely OFF")
+    parser.add_argument("--no-subtitles", action="store_true")
     parser.add_argument("--caption-style", choices=CAPTION_STYLES, default="beast-bold")
     parser.add_argument("--hook-style", choices=HOOK_STYLES, default="mid-card")
     parser.add_argument("--ai-provider", choices=["auto", "groq", "gemini", "ollama", "heuristic"], default="auto")
@@ -1290,8 +1339,8 @@ def main():
     is_local = os.path.isfile(args.url)
     use_surgical = (not is_local) and (args.fetch_mode == "surgical" or (args.fetch_mode == "auto" and duration >= 2700.0))
 
-    src_sid = hashlib.md5(f"v9|{args.url}|{min_height}".encode()).hexdigest()[:10]
-    run_sid = hashlib.md5(f"v9|{args.url}|{args.clips}|{min_len}|{max_len}|{min_height}|{args.layout}|{args.cam_pos}|{args.cam_w}|{args.cam_h}|{args.cam_x}|{args.cam_y}|{effective_caption_style}|{args.hook_style}|{args.sfx}".encode()).hexdigest()[:10]
+    src_sid = hashlib.md5(f"v10|{args.url}|{min_height}".encode()).hexdigest()[:10]
+    run_sid = hashlib.md5(f"v10|{args.url}|{args.clips}|{min_len}|{max_len}|{min_height}|{args.layout}|{args.cam_pos}|{args.cam_w}|{args.cam_h}|{args.cam_x}|{args.cam_y}|{effective_caption_style}|{args.hook_style}|{args.sfx}".encode()).hexdigest()[:10]
 
     shared_cache = os.path.abspath(os.path.join(args.work_dir, f"src_{src_sid}"))
     local_work = os.path.abspath(os.path.join(args.work_dir, f"run_{run_sid}"))
@@ -1308,7 +1357,7 @@ def main():
 
     font_family = prepare_local_fonts(local_work)
     if not has_ffmpeg_ass_filter():
-        print("WARNING: FFmpeg 'ass' filter (libass) not detected in this build!")
+        log("WARNING: FFmpeg 'ass' filter (libass) not detected in this build!")
 
     if args.preview_layout:
         run_instant_preview(
@@ -1318,7 +1367,7 @@ def main():
         )
         return
 
-    print(f"[1/5] Stream: '{title}' | {duration/3600:.2f} hrs | mode={'SURGICAL HD' if use_surgical else 'FULL/LOCAL HD'} | subs={effective_caption_style} | sfx={args.sfx}")
+    log(f"[1/5] Stream: '{title}' | {duration/60:.1f} min | mode={'SURGICAL HD' if use_surgical else 'FULL/LOCAL HD'} | subs={effective_caption_style} | sfx={args.sfx}")
     heatmap_scores = extract_heatmap_scores(meta)
     scout_segs = []
     energy_scores = defaultdict(float)
@@ -1332,7 +1381,7 @@ def main():
                 cached_sel = json.load(f)
             if len(cached_sel) >= args.clips:
                 selected = cached_sel[: args.clips]
-                print(f"[2/5] Resuming checkpoint: loaded {len(selected)} clips from Drive.")
+                log(f"[2/5] Resuming checkpoint: loaded {len(selected)} clips from Drive.")
         except Exception:
             selected = []
 
@@ -1348,15 +1397,6 @@ def main():
             scan_media = full_src_mp4 if full_src_mp4 else download_audio_only(args.url, os.path.join(shared_cache, "scout_audio.m4a"), args.cookies)
             if scan_media:
                 energy_scores = stream_audio_peaks_zero_disk(scan_media, os.path.join(shared_cache, "audio_energy.json"))
-                if not scout_segs:
-                    wm_scout = load_whisper_once()
-                    if wm_scout:
-                        top_cands = build_stratified_candidates([], energy_scores, heatmap_scores, duration, max(args.clips, 20), min_len, max_len)[: max(args.clips * 2, 40)]
-                        print(f"  -> No captions found; fast-transcribing {len(top_cands)} top hype windows...")
-                        for c_idx, (_, ts) in enumerate(top_cands, 1):
-                            sl_segs = transcribe_slice_exact(wm_scout, scan_media, os.path.join(shared_cache, f"sc_{c_idx}.wav"), start_s=ts, dur_s=max_len + 6.0)
-                            for s in sl_segs:
-                                scout_segs.append({"start": round(ts + s["start"], 2), "end": round(ts + s["end"], 2), "text": s["text"]})
 
         selected = select_clips_scalable(
             scout_segs, energy_scores, heatmap_scores, duration, args.clips, min_len, max_len, args.ai_provider, args.ollama_model
@@ -1365,8 +1405,11 @@ def main():
             json.dump(selected, f, indent=2)
 
     sfx_pack = generate_sfx_pack(os.path.join(shared_cache, "sfx_pack")) if args.sfx else None
+    enc_name, enc_args = detect_fast_1080p_encoder()
+    workers = 3 if enc_name == "h264_nvenc" else max(1, min(args.workers, os.cpu_count() or 4))
 
-    print(f"[3/5] Fetching strict HD clips + exact 0.000s word sync + dynamic SFX mapping...")
+    # --- STAGE 1: Fetch HD clips & encode 0.000s-locked 1080x1920 intermediates ---
+    log(f"[3/5] Stage 1: Fetching HD + locking {len(selected)} clips to 0.000s ({workers} workers, {enc_name})...")
     clip_inputs = {}
     if use_surgical:
         def _dl_one(item):
@@ -1384,14 +1427,14 @@ def main():
                     clip_inputs[i] = ("DONE", None, None, True)
                 elif path:
                     cdur, haud, _, h = probe_video_info(path)
-                    print(f"  -> Clip {i} fetched at {h}p ({cdur:.1f}s)")
+                    log(f"  -> Clip {i}/{len(selected)} fetched at {h}p ({cdur:.1f}s)")
                     clip_inputs[i] = (path, None, min(max_len, max(5.0, cdur or selected[i - 1]["duration"])), haud)
                 else:
-                    print(f"  -> Clip {i} HD fetch failed: {err}")
+                    log(f"  -> Clip {i}/{len(selected)} HD fetch failed: {err}")
                     clip_inputs[i] = (None, None, 0.0, False)
     else:
         _, haud, _, h = probe_video_info(full_src_mp4)
-        print(f"  -> Local/Full source verified at {h}p")
+        log(f"  -> Local/Full source verified at {h}p")
         for i, c in enumerate(selected, 1):
             final_mp4 = os.path.join(final_shorts_dir, f"short_{i:03d}.mp4")
             if os.path.exists(final_mp4) and os.path.getsize(final_mp4) > 10240:
@@ -1399,30 +1442,47 @@ def main():
             else:
                 clip_inputs[i] = (full_src_mp4, c["start"], max(5.0, c["end"] - c["start"]), haud)
 
-    need_subs = (effective_caption_style != "none")
-    whisper_model = load_whisper_once() if need_subs else None
-    tasks = []
+    stage1_tasks = []
     skipped_rows = {}
-
     for i, c in enumerate(selected, 1):
         info = clip_inputs.get(i)
         if not info or info[0] is None:
-            skipped_rows[i] = {
-                "clip": i, "score": c.get("score", 0), "start": c["start"], "end": c["end"],
-                "duration": c["duration"], "words": 0, "title": c["title"], "file": "FAILED"
-            }
+            skipped_rows[i] = {"clip": i, "score": c.get("score", 0), "start": c["start"], "end": c["end"], "duration": c["duration"], "words": 0, "title": c["title"], "file": "FAILED"}
             continue
         if info[0] == "DONE":
-            skipped_rows[i] = {
-                "clip": i, "score": c.get("score", 0), "start": c["start"], "end": c["end"],
-                "duration": c["duration"], "words": -1, "title": c["title"], "file": f"short_{i:03d}.mp4"
-            }
+            skipped_rows[i] = {"clip": i, "score": c.get("score", 0), "start": c["start"], "end": c["end"], "duration": c["duration"], "words": -1, "title": c["title"], "file": f"short_{i:03d}.mp4"}
             continue
-
         src_path, seek_s, rdur, haud = info
+        stage1_tasks.append((src_path, seek_s, rdur, i, local_work, enc_name, enc_args, args.layout, args.cam_pos, args.cam_w, args.cam_h, args.cam_x, args.cam_y, haud))
+
+    stage1_ready = {}
+    if stage1_tasks:
+        with ProcessPoolExecutor(max_workers=workers) as pool:
+            futs = {pool.submit(_stage1_trim_worker, t): t for t in stage1_tasks}
+            for fut in as_completed(futs):
+                idx, s1_path, el, err = fut.result()
+                if s1_path:
+                    stage1_ready[idx] = s1_path
+                    log(f"  -> Stage 1 locked clip {idx}/{len(selected)} in {el:.1f}s")
+                else:
+                    c = selected[idx - 1]
+                    log(f"  -> Stage 1 FAILED clip {idx}: {err}")
+                    skipped_rows[idx] = {"clip": idx, "score": c.get("score", 0), "start": c["start"], "end": c["end"], "duration": c["duration"], "words": 0, "title": c["title"], "file": "FAILED"}
+
+    # --- STAGE 2: Zero-seek Whisper + Dynamic SFX on locked stage1 clips ---
+    need_subs = (effective_caption_style != "none")
+    whisper_model = load_whisper_once() if (need_subs and stage1_ready) else None
+    stage3_tasks = []
+
+    for idx in sorted(stage1_ready.keys()):
+        s1_path = stage1_ready[idx]
+        c = selected[idx - 1]
+        s1_dur, haud, _, _ = probe_video_info(s1_path)
+        rdur = s1_dur or c["duration"]
+
         rel_segs = []
         if need_subs and haud:
-            sub_cache = os.path.join(local_work, f"words_{i:03d}.json")
+            sub_cache = os.path.join(local_work, f"words_{idx:03d}.json")
             if os.path.exists(sub_cache):
                 try:
                     with open(sub_cache, "r", encoding="utf-8") as f:
@@ -1430,7 +1490,7 @@ def main():
                 except Exception:
                     rel_segs = []
             if not rel_segs and whisper_model is not None:
-                rel_segs = transcribe_slice_exact(whisper_model, src_path, os.path.join(local_work, f"w_{i:03d}.wav"), start_s=seek_s, dur_s=rdur)
+                rel_segs = transcribe_stage1_exact(whisper_model, s1_path, os.path.join(local_work, f"w_{idx:03d}.wav"))
                 if rel_segs:
                     with open(sub_cache, "w", encoding="utf-8") as f:
                         json.dump(rel_segs, f)
@@ -1440,40 +1500,36 @@ def main():
                     for s in scout_segs if s["end"] > c["start"] and s["start"] < c["end"]
                 ]
 
-        sfx_events = plan_clip_sfx(src_path, seek_s, rdur, rel_segs, sfx_pack) if (args.sfx and haud) else []
-        tasks.append((
-            src_path, seek_s, rdur, i, c, local_work, local_shorts, final_shorts_dir,
-            None, None, rel_segs, effective_caption_style, args.hook_style,
-            args.layout, args.cam_pos, args.cam_w, args.cam_h, args.cam_x, args.cam_y,
-            sfx_events, haud, font_family
+        sfx_events = plan_clip_sfx_stage1(s1_path, rdur, rel_segs, sfx_pack) if (args.sfx and haud) else []
+        stage3_tasks.append((
+            s1_path, rdur, idx, c, local_work, local_shorts, final_shorts_dir,
+            enc_name, enc_args, rel_segs, effective_caption_style, args.hook_style,
+            args.layout, sfx_events, haud, font_family
         ))
 
     del whisper_model
 
-    enc_name, enc_args = detect_fast_1080p_encoder()
-    workers = 3 if enc_name == "h264_nvenc" else max(1, min(args.workers, os.cpu_count() or 4))
-    tasks = [t[:8] + (enc_name, enc_args) + t[10:] for t in tasks]
-    print(f"[4/5] Rendering {len(tasks)} HD Shorts ({len(skipped_rows)} cached, {workers} workers, {enc_name}, layout={args.layout})...")
-
+    # --- STAGE 3: Burn synced captions/hook + mix dynamic SFX -> copy to Drive ---
+    log(f"[4/5] Stage 3: Finalizing {len(stage3_tasks)} HD Shorts ({len(skipped_rows)} cached/skipped, {workers} workers, {enc_name})...")
     results_map = dict(skipped_rows)
-    if tasks:
+    if stage3_tasks:
         with ProcessPoolExecutor(max_workers=workers) as pool:
-            futures = {pool.submit(_render_worker, t): (t[3], t[4]) for t in tasks}
-            for fut in as_completed(futures):
-                i, c = futures[fut]
+            futs = {pool.submit(_stage3_finish_worker, t): (t[2], t[3]) for t in stage3_tasks}
+            for fut in as_completed(futs):
+                i, c = futs[fut]
                 idx, fname, elapsed, wcount, sfx_n, err = fut.result()
                 results_map[idx] = {
                     "clip": idx, "score": c.get("score", 0), "start": c["start"], "end": c["end"],
                     "duration": c["duration"], "words": wcount, "title": c["title"], "file": fname
                 }
                 if err:
-                    print(f"  [{idx}/{len(selected)}] FAILED ({elapsed:.1f}s): {err}")
+                    log(f"  [{idx}/{len(selected)}] FAILED ({elapsed:.1f}s): {err}")
                 else:
-                    print(f"  [{idx}/{len(selected)}] Score {c.get('score',0)} | words={wcount} | sfx={sfx_n} | {c['start']}s->{c['end']}s ({c['duration']}s) in {elapsed:.1f}s | {c['title']}")
+                    log(f"  [{idx}/{len(selected)}] SAVED -> {fname} | score={c.get('score',0)} | words={wcount} | sfx={sfx_n} | {elapsed:.1f}s | {c['title']}")
 
     rows = [results_map[i] for i in sorted(results_map.keys())]
     build_top_10_viral(final_session_dir, rows, local_work, font_family)
-    print(f"\nDONE in {time.time() - t0:.1f}s total! Output: {final_session_dir}")
+    log(f"\nDONE in {time.time() - t0:.1f}s total! Output: {final_session_dir}")
 
 if __name__ == "__main__":
     main()
